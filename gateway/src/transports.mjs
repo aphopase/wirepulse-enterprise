@@ -1,3 +1,5 @@
+import { StringDecoder } from "node:string_decoder";
+
 // Transport contract: send(text) -> {sequence, byteLength, at}; rxSequence(); subscribe(cb(line)) -> unsubscribe; close().
 function createCore() {
   const listeners = new Set();
@@ -31,7 +33,8 @@ export async function openSerialTransport({ path, baudRate = 115200, dataBits = 
   const port = new SerialPort({ path, baudRate, dataBits, stopBits, parity, rtscts, autoOpen: false });
   await new Promise((resolve, reject) => port.open((error) => error ? reject(error) : resolve()));
   let pending = "";
-  port.on("data", (chunk) => { pending += chunk.toString("utf8"); const cut = Math.max(pending.lastIndexOf("\n"), pending.lastIndexOf("\r")); if (cut === -1) return; const complete = pending.slice(0, cut + 1); pending = pending.slice(cut + 1); core.receive(complete); });
+  const decoder = new StringDecoder("utf8"); // a character can arrive in two reads; decoding each chunk alone would turn it into U+FFFD
+  port.on("data", (chunk) => { pending += decoder.write(chunk); const cut = Math.max(pending.lastIndexOf("\n"), pending.lastIndexOf("\r")); if (cut === -1) return; const complete = pending.slice(0, cut + 1); pending = pending.slice(cut + 1); core.receive(complete); });
   return {
     rxSequence: core.rxSequence, subscribe: core.subscribe,
     async send(text) { const data = Buffer.from(text + ending); await new Promise((resolve, reject) => port.write(data, (error) => error ? reject(error) : port.drain((drainError) => drainError ? reject(drainError) : resolve()))); return { sequence: core.nextTx(), byteLength: data.length, at: Date.now() }; },

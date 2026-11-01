@@ -14,19 +14,30 @@ const schema = z.object({
   NODE_ENV: z.string().optional(),
   PORT: int(0, 65535, 8080),
   DATABASE_URL: z.string().url(),
+  LISTEN_DATABASE_URL: z.string().url().optional(),
   DB_POOL_SIZE: int(1, 200, 10),
   DB_SSL: z.enum(["off", "require", "verify"]).default("off"),
   DB_SSL_CA_FILE: z.string().optional(),
   DB_STATEMENT_TIMEOUT_MS: int(100, 600_000, 15_000),
   DB_IDLE_TX_TIMEOUT_MS: int(100, 600_000, 15_000),
   DB_CONNECT_TIMEOUT_MS: int(100, 120_000, 5_000),
+  // Row-level security (migration 008): request handlers run as a role the database confines to the caller's workspace. Switch off only
+  // for a database where the migrating user could not create that role (a managed service that forbids it); see DEPLOYMENT.md.
+  DB_ROW_LEVEL_SECURITY: flag(true),
+  SHUTDOWN_DRAIN_MS: int(0, 8_000, 2_000),
   MIGRATE_ON_START: flag(true),
+  MIGRATE_LOCK_TIMEOUT_MS: int(0, 600_000, 1_000),
+  MIGRATE_LOCK_RETRY_SECONDS: int(0, 3600, 120),
   CORS_ORIGINS: z.string().optional(),
   TRUST_PROXY: z.string().optional(),
   OIDC_ISSUER: z.string().url().optional(),
   OIDC_AUDIENCE: z.string().min(1).optional(),
   OIDC_JWKS_URI: z.string().url().optional(),
   OIDC_TRUST_UNVERIFIED_EMAIL: flag(false),
+  // Browser sign-in (the console's "Sign in with SSO"): the public client the console uses with the authorization code flow and PKCE.
+  OIDC_CLIENT_ID: z.string().min(1).max(256).optional(),
+  OIDC_SCOPES: z.string().min(1).max(500).regex(/^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/, "space-separated scope tokens").default("openid email profile"),
+  OIDC_AUTHORIZE_AUDIENCE: flag(false),
   DEV_BEARER_TOKEN: z.string().min(8).optional(),
   DEV_SUBJECT: z.string().min(1).max(200).optional(),
   DEV_EMAIL: z.string().max(200).optional(),
@@ -43,11 +54,13 @@ const schema = z.object({
   QUEUE_TTL_SECONDS: int(0, 31_536_000, 86_400),
   INVITATION_TTL_DAYS: int(1, 90, 7),
   API_KEY_MAX_DAYS: int(1, 3650, 365),
+  SCIM_TOKEN_MAX_DAYS: int(1, 3650, 365),
   RETENTION_DAYS_JOBS: int(0, 36_500, 0),
   RETENTION_DAYS_REPORTS: int(0, 36_500, 0),
   RETENTION_DAYS_AUDIT: int(0, 36_500, 0),
   RETENTION_INTERVAL_HOURS: int(1, 720, 24),
   SSE_MAX_CLIENTS: int(1, 100_000, 500),
+  SSE_MAX_CLIENTS_PER_WORKSPACE: int(1, 100_000, 100),
   SSE_HEARTBEAT_MS: int(1000, 120_000, 15_000),
   SSE_MAX_LIFETIME_SECONDS: int(10, 86_400, 1800),
   DEFAULT_PLAN: z.enum(PLAN_NAMES).default("enterprise"),
@@ -109,6 +122,7 @@ export function loadConfig(env = process.env) {
   if (production && !corsOrigins.length) problems.push("CORS_ORIGINS must list the exact https browser origin(s) in production");
 
   if (Boolean(v.OIDC_ISSUER) !== Boolean(v.OIDC_AUDIENCE)) problems.push("OIDC_ISSUER and OIDC_AUDIENCE must be set together");
+  if (v.OIDC_CLIENT_ID && !v.OIDC_ISSUER) problems.push("OIDC_CLIENT_ID needs OIDC_ISSUER and OIDC_AUDIENCE");
   if (production) {
     if (v.DEV_BEARER_TOKEN) problems.push("DEV_BEARER_TOKEN must not be set in production; configure OIDC instead");
     if (!v.OIDC_ISSUER) problems.push("OIDC_ISSUER and OIDC_AUDIENCE are required in production");
@@ -144,6 +158,7 @@ export function loadConfig(env = process.env) {
 
   if (production && v.DB_SSL === "off") warnings.push("DB_SSL=off: database traffic is not encrypted; acceptable only on a private network");
   if (production && v.TRUST_PROXY === undefined) warnings.push("TRUST_PROXY is unset: client IPs (rate limits, audit) will be the reverse proxy's address");
+  if (!v.DB_ROW_LEVEL_SECURITY) warnings.push("DB_ROW_LEVEL_SECURITY=false: only the application's own workspace checks separate tenants; the database-level barrier is off");
   if (v.DB_SSL === "require") warnings.push("DB_SSL=require encrypts but does not verify the server certificate; use DB_SSL=verify");
 
   return Object.freeze({
@@ -151,18 +166,23 @@ export function loadConfig(env = process.env) {
     port: v.PORT,
     logLevel: v.LOG_LEVEL,
     databaseUrl: v.DATABASE_URL,
-    db: { poolSize: v.DB_POOL_SIZE, ssl, statementTimeoutMs: v.DB_STATEMENT_TIMEOUT_MS, idleTxTimeoutMs: v.DB_IDLE_TX_TIMEOUT_MS, connectTimeoutMs: v.DB_CONNECT_TIMEOUT_MS },
+    listenDatabaseUrl: v.LISTEN_DATABASE_URL,
+    db: { poolSize: v.DB_POOL_SIZE, ssl, statementTimeoutMs: v.DB_STATEMENT_TIMEOUT_MS, idleTxTimeoutMs: v.DB_IDLE_TX_TIMEOUT_MS, connectTimeoutMs: v.DB_CONNECT_TIMEOUT_MS, rowLevelSecurity: v.DB_ROW_LEVEL_SECURITY },
+    shutdownDrainMs: v.SHUTDOWN_DRAIN_MS,
     migrateOnStart: v.MIGRATE_ON_START,
+    migrateLockTimeoutMs: v.MIGRATE_LOCK_TIMEOUT_MS,
+    migrateLockRetryMs: v.MIGRATE_LOCK_RETRY_SECONDS * 1000,
     corsOrigins,
     trustProxy: parseTrustProxy(v.TRUST_PROXY),
-    oidc: v.OIDC_ISSUER ? { issuer: v.OIDC_ISSUER.replace(/\/$/, ""), audience: v.OIDC_AUDIENCE, jwksUri: v.OIDC_JWKS_URI ?? null, trustUnverifiedEmail: v.OIDC_TRUST_UNVERIFIED_EMAIL } : null,
+    oidc: v.OIDC_ISSUER ? { issuer: v.OIDC_ISSUER.replace(/\/$/, ""), audience: v.OIDC_AUDIENCE, jwksUri: v.OIDC_JWKS_URI ?? null, trustUnverifiedEmail: v.OIDC_TRUST_UNVERIFIED_EMAIL, browser: v.OIDC_CLIENT_ID ? { clientId: v.OIDC_CLIENT_ID, scopes: v.OIDC_SCOPES, sendAudience: v.OIDC_AUTHORIZE_AUDIENCE } : null } : null,
     dev: v.DEV_BEARER_TOKEN ? { token: v.DEV_BEARER_TOKEN, subject: v.DEV_SUBJECT ?? "dev-admin", email: v.DEV_EMAIL ?? "admin@wirepulse.local" } : null,
     limits: { subjectPerMinute: v.RATE_LIMIT_PER_MINUTE, ipPerMinute: v.RATE_LIMIT_IP_PER_MINUTE, gatewayPerMinute: v.GATEWAY_RATE_LIMIT_PER_MINUTE, authFailurePerMinute: v.AUTH_FAILURE_LIMIT_PER_MINUTE, jsonBytes: v.MAX_JSON_BYTES, evidenceBytes: v.MAX_EVIDENCE_BYTES, maxQueuedJobs: v.MAX_QUEUED_JOBS_PER_WORKSPACE },
     jobs: { leaseSeconds: v.JOB_LEASE_SECONDS, maxAttempts: v.JOB_MAX_ATTEMPTS, sweepIntervalMs: v.SWEEP_INTERVAL_MS, queueTtlSeconds: v.QUEUE_TTL_SECONDS },
     invitationTtlDays: v.INVITATION_TTL_DAYS,
     apiKeyMaxDays: v.API_KEY_MAX_DAYS,
+    scimTokenMaxDays: v.SCIM_TOKEN_MAX_DAYS,
     retention: { jobsDays: v.RETENTION_DAYS_JOBS, reportsDays: v.RETENTION_DAYS_REPORTS, auditDays: v.RETENTION_DAYS_AUDIT, intervalHours: v.RETENTION_INTERVAL_HOURS },
-    sse: { maxClients: v.SSE_MAX_CLIENTS, heartbeatMs: v.SSE_HEARTBEAT_MS, maxLifetimeMs: v.SSE_MAX_LIFETIME_SECONDS * 1000 },
+    sse: { maxClients: v.SSE_MAX_CLIENTS, maxClientsPerWorkspace: v.SSE_MAX_CLIENTS_PER_WORKSPACE, heartbeatMs: v.SSE_HEARTBEAT_MS, maxLifetimeMs: v.SSE_MAX_LIFETIME_SECONDS * 1000 },
     metrics: { token: v.METRICS_TOKEN ?? null, port: v.METRICS_PORT },
     saas: { defaultPlan: v.DEFAULT_PLAN, maxWorkspacesPerUser: v.MAX_WORKSPACES_PER_USER, purgeGraceDays: v.WORKSPACE_PURGE_GRACE_DAYS, purgeIntervalMs: v.WORKSPACE_PURGE_INTERVAL_MS },
     redis: v.REDIS_URL ? { url: v.REDIS_URL } : null,

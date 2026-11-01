@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: wirepulse }
+spec: { selector: { app: postgres }, ports: [{ port: 5432 }], clusterIP: None }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: postgres, namespace: wirepulse }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      nodeSelector: { wirepulse.test/role: data }  # so that draining the other worker evicts only API pods
+      securityContext: { runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, fsGroup: 70, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports: [{ containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_DB, value: wirepulse }
+            - { name: POSTGRES_USER, value: wirepulse }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: postgres-auth, key: password } } }
+          args: ["-c", "max_connections=300"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          readinessProbe: { exec: { command: ["pg_isready", "-U", "wirepulse", "-d", "wirepulse"] }, periodSeconds: 3 }
+          resources: { requests: { cpu: "1", memory: 512Mi } }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }

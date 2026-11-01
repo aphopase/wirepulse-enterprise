@@ -24,6 +24,16 @@ test("a response that arrived before the command is rejected as stale", async ()
   assert.ok(evidence.events.some((event) => event.type === "attempt.timed_out"));
 });
 
+test("a device that answers before send() returns is not mistaken for stale data", async () => {
+  // A fast device (USB CDC, a pseudo-terminal, a quick MCU) can reply while the write is still being drained. That reply belongs to
+  // the command just sent; only data that was there before the command is stale.
+  const base = createSimulatedTransport();
+  const transport = { ...base, async send(text) { const receipt = await base.send(text); base.injectStale("READY"); await new Promise((resolve) => setImmediate(resolve)); return receipt; } };
+  const { results, evidence } = await runSuite({ tests: suite(), transport });
+  assert.equal(results[0].status, "passed");
+  assert.equal(verifyEvidence(evidence, results).valid, true);
+});
+
 test("retries open a fresh response window and can pass on a later attempt", async () => {
   let calls = 0;
   const transport = createSimulatedTransport({ responder: () => (++calls === 2 ? ["READY"] : []) });

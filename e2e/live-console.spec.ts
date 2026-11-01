@@ -1,5 +1,5 @@
 // The browser console against the real control plane: real API, real PostgreSQL, real gateway agent (simulated serial device).
-// Needs WP_TEST_DATABASE_URL, like the API tests; skipped without it. Run with the dev server on :5173 (npm run dev).
+// Needs WP_TEST_DATABASE_URL, like the API tests; skipped without it. Run with the dev server on :5173 (npm run dev), or on another origin named by WP_E2E_ORIGIN.
 import { expect, test, type Page } from "@playwright/test";
 // Plain ESM helpers shared with the API test-suite (no type declarations).
 // @ts-ignore
@@ -11,7 +11,7 @@ import { createAgent, createAgentLog } from "../gateway/src/agent.mjs";
 // @ts-ignore
 import { createSimulatedTransport } from "../gateway/src/transports.mjs";
 
-const ORIGIN = "http://127.0.0.1:5173";
+const ORIGIN = process.env.WP_E2E_ORIGIN ?? "http://127.0.0.1:5173";
 test.skip(!!skip, String(skip));
 test.describe.configure({ mode: "serial" });
 
@@ -293,4 +293,152 @@ test("when the server has webhooks switched off the Webhooks tab says so instead
   await expect(console_(page).getByText(/Webhooks are not enabled on this server/)).toBeVisible();
   await expect(console_(page).getByRole("button", { name: "Add webhook" })).toHaveCount(0);
   await expect(console_(page).getByRole("status")).toHaveText("");
+});
+
+test("provisioning: an administrator issues a SCIM token, sees who the identity provider created, is warned before the token lapses, and revoking it locks the provider out", async ({ page }) => {
+  const workspaceId = await openWorkspace(page, "Provision Lab");
+  const scim = (token: string, method: string, path: string, body?: unknown) => fetch(`${api.url}/scim/v2${path}`, { method, headers: { authorization: `Bearer ${token}`, "content-type": "application/scim+json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  const person = (userName: string, role = "engineer") => ({ schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], userName, emails: [{ value: userName, primary: true }], roles: [{ value: role }], active: true });
+
+  await tab(page, "Provisioning").click();
+  await expect(console_(page).getByTestId("scim-base-url")).toHaveText(`${api.url}/scim/v2`);
+  await expect(console_(page).getByText("No provisioning tokens.")).toBeVisible();
+  await expect(console_(page).getByText("Nobody has been provisioned yet.")).toBeVisible();
+
+  await console_(page).getByLabel("Name").fill("okta-production");
+  await console_(page).getByRole("button", { name: "Create token" }).click();
+  const token = await secretOf(page);
+  expect(token).toMatch(/^wps_[A-Za-z0-9_-]{40,}$/);
+  await console_(page).getByRole("button", { name: "I have saved it — hide" }).click();
+  expect(await page.content()).not.toContain(token); // never rendered again once hidden
+  const row = console_(page).locator(".ec-job", { hasText: "okta-production" });
+  await expect(row.getByTestId("scim-token-state")).toHaveText("ok");
+  await expect(row).toContainText("Never used");
+
+  // What the identity provider does, with the token the page just showed.
+  const created = await scim(token, "POST", "/Users", person("quinn@example.com"));
+  expect(created.status).toBe(201);
+  const quinn = (await created.json()) as { id: string };
+  await console_(page).getByRole("button", { name: "Refresh", exact: true }).click();
+  const quinnRow = console_(page).locator(".ec-job", { hasText: "quinn@example.com" });
+  await expect(quinnRow.getByTestId("provisioned-state")).toHaveText("pending");
+  await expect(quinnRow).toContainText("engineer");
+  await expect(row).not.toContainText("Never used");
+
+  // The provider cannot demote the workspace's only administrator; provisioned with the role they hold, the record binds on their next sign-in.
+  const demotion = await scim(token, "POST", "/Users", person("admin@wirepulse.local", "viewer"));
+  expect([demotion.status, ((await demotion.json()) as { detail: string }).detail]).toEqual([409, "last_administrator"]);
+  expect((await scim(token, "POST", "/Users", person("admin@wirepulse.local", "administrator"))).status).toBe(201);
+  expect((await admin("/v1/workspaces")).status).toBe(200);
+  await console_(page).getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(console_(page).locator(".ec-job", { hasText: "admin@wirepulse.local" }).getByTestId("provisioned-state")).toHaveText("active");
+  expect((await admin(`${ws(workspaceId)}/members`)).body.find((member: { email: string }) => member.email === "admin@wirepulse.local").role).toBe("administrator");
+
+  // The provider deactivates the leaver; the console shows it.
+  expect((await scim(token, "PATCH", `/Users/${quinn.id}`, { schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], Operations: [{ op: "replace", path: "active", value: false }] })).status).toBe(200);
+  await console_(page).getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(quinnRow.getByTestId("provisioned-state")).toHaveText("deactivated");
+
+  // A token about to expire is flagged, an expired one is flagged louder, and with none usable the page says deprovisioning has stopped.
+  await api.db.query("UPDATE scim_tokens SET expires_at = now() + interval '5 days' WHERE workspace_id = $1", [workspaceId]);
+  await tab(page, "Usage").click();
+  await tab(page, "Provisioning").click();
+  await expect(row.getByTestId("scim-token-state")).toHaveText("expiring");
+  await expect(row.getByRole("alert")).toContainText("expires in 5 days");
+  await api.db.query("UPDATE scim_tokens SET expires_at = now() - interval '1 day' WHERE workspace_id = $1", [workspaceId]);
+  await tab(page, "Usage").click();
+  await tab(page, "Provisioning").click();
+  await expect(row.getByTestId("scim-token-state")).toHaveText("expired");
+  await expect(row.getByRole("alert")).toContainText("can no longer remove leavers");
+  await expect(console_(page).getByText(/No usable token/)).toBeVisible();
+  expect((await scim(token, "GET", "/Users")).status).toBe(401);
+
+  // Replacement token: works, and revoking it from the console locks the provider out at once.
+  await console_(page).getByLabel("Name").fill("okta-rotated");
+  await console_(page).getByRole("button", { name: "Create token" }).click();
+  const replacement = await secretOf(page);
+  await console_(page).getByRole("button", { name: "I have saved it — hide" }).click();
+  expect((await scim(replacement, "GET", "/Users")).status).toBe(200);
+  const fresh = console_(page).locator(".ec-job", { hasText: "okta-rotated" });
+  await fresh.getByRole("button", { name: "Revoke" }).click();
+  await expect(fresh.getByTestId("scim-token-state")).toHaveText("revoked");
+  expect((await scim(replacement, "GET", "/Users")).status).toBe(401);
+
+  // A plan without provisioning explains the limit in plain words instead of failing opaquely.
+  await api.db.query("UPDATE workspaces SET plan = 'free' WHERE id = $1", [workspaceId]);
+  await console_(page).getByLabel("Name").fill("not-allowed");
+  await console_(page).getByRole("button", { name: "Create token" }).click();
+  await expect(console_(page).getByRole("status")).toContainText("the free plan limit for provisioning tokens (0) is reached");
+});
+
+test("audit: the administrator reads the trail, filters and pages it, verifies the hash chain, exports it, and is told when it has been tampered with", async ({ page }) => {
+  test.setTimeout(60_000);
+  const workspaceId = await openWorkspace(page, "Audit Lab");
+  const gateway = (await admin(`${ws(workspaceId)}/gateways`, { method: "POST", body: { name: "Bench A", labels: {} } })).body;
+  expect((await admin(`${ws(workspaceId)}/gateways/${gateway.id}`, { method: "DELETE" })).status).toBe(204);
+  // Enough further events that the trail spans more than one page.
+  for (let i = 0; i < 55; i += 1) expect((await admin(`${ws(workspaceId)}/profiles`, { method: "POST", body: { name: `profile ${i}`, definition: sampleDefinition() } })).status).toBe(201);
+
+  await tab(page, "Audit").click();
+  const rows = console_(page).locator(".ec-job");
+  await expect(rows).toHaveCount(50);
+  await expect(rows.first()).toContainText("profile.created");
+  await console_(page).getByRole("button", { name: "Load older events" }).click();
+  const exported = (await admin(`${ws(workspaceId)}/audit-events/export.ndjson`)).text.trim().split("\n").map((line: string) => JSON.parse(line));
+  await expect(rows).toHaveCount(exported.length); // 1 workspace + 1 gateway + 1 revoke + 55 profiles, nothing lost or repeated across the page boundary
+  await expect(console_(page).getByRole("button", { name: "Load older events" })).toHaveCount(0);
+  await expect(rows.last()).toContainText("workspace.created");
+
+  // A filter narrows the trail to one action and shows who did it.
+  await console_(page).getByLabel("Action (exact)").fill("gateway.revoked");
+  await console_(page).getByRole("button", { name: "Apply filter" }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("dev-admin");
+  await rows.first().getByRole("button", { name: "Details" }).click();
+  await expect(rows.first().locator("dd code", { hasText: /^[a-f0-9]{64}$/ })).toHaveCount(2); // previous and entry hash
+  await console_(page).getByLabel("Action (exact)").fill("");
+  const today = new Date().toISOString().slice(0, 10);
+  await console_(page).getByLabel("From (UTC date)").fill("2999-01-01");
+  await console_(page).getByRole("button", { name: "Apply filter" }).click();
+  await expect(console_(page).getByText("No audit events match.")).toBeVisible();
+  await console_(page).getByLabel("From (UTC date)").fill(today);
+  await console_(page).getByLabel("To (UTC date, inclusive)").fill(today);
+  await console_(page).getByRole("button", { name: "Apply filter" }).click();
+  await expect(rows.first()).toBeVisible(); // today's events are inside "today", whatever the hour
+  await console_(page).getByLabel("From (UTC date)").fill("");
+  await console_(page).getByLabel("To (UTC date, inclusive)").fill("");
+  await console_(page).getByRole("button", { name: "Apply filter" }).click();
+
+  // The chain verifies, and the head hash on screen is the one the server reports and the export ends with.
+  await console_(page).getByRole("button", { name: "Verify chain" }).click();
+  await expect(console_(page).getByTestId("audit-verification")).toContainText("Chain intact");
+  await expect(console_(page).getByTestId("audit-verification")).toContainText(`${exported.length} events checked`);
+  const head = (await admin(`${ws(workspaceId)}/audit/verify`)).body.headHash;
+  expect(head).toBe(exported.at(-1).row_hash);
+  await expect(console_(page).getByTestId("audit-head-hash")).toHaveText(head);
+
+  // The file a browser saves is the same export, in chain order.
+  const [download] = await Promise.all([page.waitForEvent("download"), console_(page).getByRole("button", { name: "Export (NDJSON)" }).click()]);
+  const saved = (await (await import("node:fs/promises")).readFile((await download.path())!, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(download.suggestedFilename()).toMatch(/^wirepulse-audit-[0-9a-f]{8}\.ndjson$/);
+  expect(saved.map((event: { chain_seq: string }) => event.chain_seq)).toEqual(exported.map((event: { chain_seq: string }) => event.chain_seq));
+  expect(saved.at(-1).row_hash).toBe(head);
+
+  // Someone with database rights who rewrites an entry is caught, and the console says where.
+  const original = (await api.db.query("SELECT details FROM audit_events WHERE workspace_id = $1 AND chain_seq = 2", [workspaceId])).rows[0].details;
+  try {
+    await api.db.query("ALTER TABLE audit_events DISABLE TRIGGER audit_events_append_only");
+    await api.db.query(`UPDATE audit_events SET details = '{"name":"forged"}' WHERE workspace_id = $1 AND chain_seq = 2`, [workspaceId]);
+    await api.db.query("ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only");
+    await console_(page).getByRole("button", { name: "Verify chain" }).click();
+    await expect(console_(page).getByTestId("audit-verification")).toContainText("Chain broken");
+    await expect(console_(page).getByTestId("audit-verification")).toContainText("#2");
+    await expect(console_(page).getByTestId("audit-head-hash")).toHaveCount(0);
+  } finally {
+    await api.db.query("ALTER TABLE audit_events DISABLE TRIGGER audit_events_append_only");
+    await api.db.query("UPDATE audit_events SET details = $2 WHERE workspace_id = $1 AND chain_seq = 2", [workspaceId, original]);
+    await api.db.query("ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only");
+  }
+  await console_(page).getByRole("button", { name: "Verify chain" }).click();
+  await expect(console_(page).getByTestId("audit-verification")).toContainText("Chain intact");
 });

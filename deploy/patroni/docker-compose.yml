@@ -1,0 +1,81 @@
+# A three-member PostgreSQL cluster managed by Patroni, with a three-member etcd and HAProxy in front. Patroni decides which member is the primary,
+# promotes a standby when it dies or is partitioned, and rewinds the old primary when it comes back. Used by scripts/patroni-drill.sh.
+#
+#   POSTGRES_PASSWORD=... REPLICATION_PASSWORD=... WIREPULSE_PASSWORD=... docker compose -p wp-pat up -d --build
+#   applications connect to haproxy:5000 (read/write) or haproxy:5001 (replicas);  docker compose -p wp-pat exec pg1 /opt/patroni/bin/patronictl -c /tmp/patroni.yml list
+#
+# A reference for your own deployment, not a hardened one: the etcd members here share one Docker host, so they do not survive the host.
+#
+# Two networks, so that a partition between a PostgreSQL member and the consensus store can be made without cutting the member off from its
+# clients: "etcd" (etcd and the Patroni members) and "data" (the Patroni members, HAProxy and the application). The drill's partition test
+# runs `docker network disconnect wp-pat_etcd pg1` on the leader: it keeps serving clients and replicating, but can no longer renew its lease.
+x-etcd: &etcd
+  image: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.17}
+  restart: unless-stopped
+  networks: [etcd]
+x-pg: &pg
+  build: .
+  image: wirepulse-patroni:local
+  restart: unless-stopped
+  init: true
+  networks: [etcd, data]
+  environment: &pg-env
+    DCS_ETCD_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?}
+    WIREPULSE_PASSWORD: ${WIREPULSE_PASSWORD:?}
+    SYNCHRONOUS_MODE: ${SYNCHRONOUS_MODE:-false}
+    DCS_TTL: ${DCS_TTL:-20}
+    DCS_LOOP_WAIT: ${DCS_LOOP_WAIT:-3}
+    DCS_RETRY_TIMEOUT: ${DCS_RETRY_TIMEOUT:-5}
+  depends_on: [etcd1, etcd2, etcd3]
+
+services:
+  etcd1:
+    <<: *etcd
+    command: &etcd-cmd >
+      etcd --name etcd1 --data-dir /etcd-data --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd1:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd1:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 --initial-cluster-token wirepulse --initial-cluster-state new
+  etcd2:
+    <<: *etcd
+    command: >
+      etcd --name etcd2 --data-dir /etcd-data --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd2:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd2:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 --initial-cluster-token wirepulse --initial-cluster-state new
+  etcd3:
+    <<: *etcd
+    command: >
+      etcd --name etcd3 --data-dir /etcd-data --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd3:2379
+      --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://etcd3:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 --initial-cluster-token wirepulse --initial-cluster-state new
+  pg1:
+    <<: *pg
+    hostname: pg1
+    environment: { <<: *pg-env, PATRONI_NAME: pg1 }
+    volumes: [pg1-data:/var/lib/postgresql/data]
+  pg2:
+    <<: *pg
+    hostname: pg2
+    environment: { <<: *pg-env, PATRONI_NAME: pg2 }
+    volumes: [pg2-data:/var/lib/postgresql/data]
+  pg3:
+    <<: *pg
+    hostname: pg3
+    environment: { <<: *pg-env, PATRONI_NAME: pg3 }
+    volumes: [pg3-data:/var/lib/postgresql/data]
+  haproxy:
+    build: { context: ., dockerfile: Dockerfile.haproxy }  # the configuration is baked in: a single-file bind mount fails on NFS-backed checkouts ("Stale file handle")
+    image: wirepulse-patroni-haproxy:local
+    restart: unless-stopped
+    networks: [data]
+    depends_on: [pg1, pg2, pg3]
+
+networks:
+  etcd:
+  data:
+
+volumes:
+  pg1-data:
+  pg2-data:
+  pg3-data:

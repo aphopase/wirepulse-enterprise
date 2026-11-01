@@ -29,11 +29,15 @@ export function startOutbox({ db, config, log, metrics, deliver }) {
   const leaseSeconds = Math.ceil(((config.webhooks?.timeoutMs ?? 10_000) * 2) / 1000) + 30;
   let running = null; let stopped = false; let lastCleanup = 0;
 
+  // Due rows are taken in turns across workspaces: every workspace's oldest row before any workspace's second, and so on. One workspace
+  // with a large backlog (or an endpoint that times out) therefore cannot keep the others waiting behind it; alone, it still gets the whole batch.
   async function claim() {
     return (await db.query(
-      `WITH due AS (
-         SELECT id FROM outbox WHERE status = 'pending' AND next_attempt_at <= now() AND attempts < $1 AND (lease_expires_at IS NULL OR lease_expires_at < now())
-         ORDER BY next_attempt_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+      `WITH ranked AS (
+         SELECT id, next_attempt_at, row_number() OVER (PARTITION BY workspace_id ORDER BY next_attempt_at) AS turn
+         FROM outbox WHERE status = 'pending' AND next_attempt_at <= now() AND attempts < $1 AND (lease_expires_at IS NULL OR lease_expires_at < now())),
+       due AS (
+         SELECT o.id FROM outbox o JOIN ranked r ON r.id = o.id ORDER BY r.turn, r.next_attempt_at LIMIT $2 FOR UPDATE OF o SKIP LOCKED)
        UPDATE outbox o SET attempts = o.attempts + 1, lease_expires_at = now() + make_interval(secs => $3)
        FROM due WHERE o.id = due.id RETURNING o.id, o.workspace_id, o.kind, o.webhook_id, o.event_type, o.payload, o.attempts, o.created_at`,
       [maxAttempts, BATCH, leaseSeconds]

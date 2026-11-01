@@ -1,0 +1,31 @@
+# Applied by upgrade.sh (or your pipeline) before each rollout. Safe to run twice: migrations take an advisory lock and are recorded.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wirepulse-migrate
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: wirepulse-migrate }
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: migrate
+          image: wirepulse-api
+          imagePullPolicy: IfNotPresent
+          command: ["node", "src/migrate-cli.mjs"]
+          envFrom: [{ configMapRef: { name: wirepulse-config } }]
+          env: [{ name: DATABASE_URL_FILE, value: /run/secrets/wirepulse/database_url }]
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 256Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: secrets, mountPath: /run/secrets/wirepulse, readOnly: true }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: secrets, secret: { secretName: wirepulse-secrets, defaultMode: 0440 } }

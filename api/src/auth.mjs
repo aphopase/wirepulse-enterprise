@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { HttpError } from "./http.mjs";
+import { bindProvisioned } from "./provision.mjs";
 
 export const ROLE_ORDER = { viewer: 0, engineer: 1, maintainer: 2, administrator: 3 };
 const ASYMMETRIC = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"];
@@ -16,7 +17,17 @@ export function safeEqual(a, b) {
 
 // Authentication for the human/CI API (/v1): API keys (wpk_), the development token, or OIDC JWTs.
 // Failures are logged as security events and counted; the credential itself is never logged.
-export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req, _res, next) => next(), onAuthFailure = async () => {} }) {
+export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req, _res, next) => next(), onAuthFailure = async () => {}, onAuthSuccess = () => {} }) {
+  // Finding out who a credential belongs to, and in which workspace, comes before any workspace is known: these lookups run as the
+  // database's unrestricted role. Everything after them runs inside the workspace they established (see scope below).
+  const system = db?.system ?? db;
+  // Puts the rest of the request inside the caller's workspace for row-level security. Must run after anything that reads the request body
+  // (the body parser's callbacks do not carry the context along), so it is its own step for the routes whose authentication comes first.
+  const scope = (req, _res, next) => {
+    const workspaceId = req.workspaceId ?? req.gateway?.workspace_id;
+    return workspaceId && db?.inWorkspace ? db.inWorkspace(workspaceId, next) : next();
+  };
+
   // Where the signing keys live: OIDC_JWKS_URI if set, otherwise whatever the issuer's discovery document says (every standard IdP
   // publishes it there, at a different path each). A failed discovery is retried after 30 seconds, not on every request.
   let keys = null; let retryAt = 0;
@@ -37,26 +48,31 @@ export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req,
     return keys;
   }
 
-  async function reject(req, res, kind, reason, status = 401, code = "invalid_bearer_token") {
+  async function deny(req, kind, reason) {
     metrics?.authFailures.inc({ kind, reason });
     (req.log ?? log).warn({ security: true, event: "auth.failed", kind, reason, ip: req.ip, path: req.path }, "authentication failed");
     await onAuthFailure(req); // counted before the answer leaves, so the very next attempt already sees it
+  }
+
+  async function reject(req, res, kind, reason, status = 401, code = "invalid_bearer_token") {
+    await deny(req, kind, reason);
     return res.status(status).json({ error: code, requestId: req.requestId });
   }
 
   async function apiKeyIdentity(token) {
-    const result = await db.query(
+    const result = await system.query(
       "UPDATE api_keys SET last_used_at = now() WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute') RETURNING id, workspace_id, role",
       [sha256(token)]
     );
     let row = result.rows[0];
     // The throttled UPDATE returns nothing when the key was used within the last minute; read it instead.
-    if (!row) row = (await db.query("SELECT id, workspace_id, role FROM api_keys WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()", [sha256(token)])).rows[0];
+    if (!row) row = (await system.query("SELECT id, workspace_id, role FROM api_keys WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()", [sha256(token)])).rows[0];
     return row ? { kind: "api_key", subject: `apikey:${row.id}`, email: null, emailVerified: false, apiKey: { id: row.id, workspaceId: row.workspace_id, role: row.role } } : null;
   }
 
   async function oidcIdentity(token) {
-    const { payload } = await jwtVerify(token, await keySet(), { issuer: config.oidc.issuer, audience: config.oidc.audience, algorithms: ASYMMETRIC, clockTolerance: 30 });
+    // The configured issuer has its trailing slash removed; some providers (Auth0) put one in every token's iss, so both forms are the same issuer.
+    const { payload } = await jwtVerify(token, await keySet(), { issuer: [config.oidc.issuer, `${config.oidc.issuer}/`], audience: config.oidc.audience, algorithms: ASYMMETRIC, clockTolerance: 30 });
     if (typeof payload.sub !== "string" || !payload.sub) throw new Error("subject_missing");
     const emailVerified = payload.email_verified === true || config.oidc.trustUnverifiedEmail;
     return { kind: "user", subject: payload.sub, email: emailVerified && typeof payload.email === "string" ? payload.email.toLowerCase() : null, emailVerified };
@@ -76,6 +92,7 @@ export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req,
         try { who = await oidcIdentity(token); } catch (error) { return reject(req, res, "oidc", error.code ?? error.message); }
       } else return reject(req, res, "none", "no_identity_provider", 401, "invalid_bearer_token");
       req.identity = who;
+      onAuthSuccess(req);
       return next();
     } catch (error) { return next(error); }
   };
@@ -89,11 +106,15 @@ export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req,
       let role = null; let plan = null;
       if (req.identity.apiKey) {
         if (req.identity.apiKey.workspaceId === workspaceId) {
-          const workspace = (await db.query("SELECT plan FROM workspaces WHERE id = $1 AND deleted_at IS NULL", [workspaceId])).rows[0];
+          const workspace = (await system.query("SELECT plan FROM workspaces WHERE id = $1 AND deleted_at IS NULL", [workspaceId])).rows[0];
           if (workspace) { role = req.identity.apiKey.role; plan = workspace.plan; }
         }
       } else {
-        const member = (await db.query("SELECT m.role, w.plan FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id WHERE m.workspace_id = $1 AND m.subject = $2 AND w.deleted_at IS NULL", [workspaceId, req.identity.subject])).rows[0];
+        const lookup = async () => (await system.query("SELECT m.role, w.plan FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id WHERE m.workspace_id = $1 AND m.subject = $2 AND w.deleted_at IS NULL", [workspaceId, req.identity.subject])).rows[0];
+        // Somebody the identity provider provisioned becomes a member on their first request here. Looked up again whether or not this request
+        // did the binding: a request of theirs running at the same moment may have, and must not be refused for it.
+        let member = await lookup();
+        if (!member) { await bindProvisioned(system, req, workspaceId); member = await lookup(); }
         if (member) { role = member.role; plan = member.plan; }
       }
       if (!role || ROLE_ORDER[role] < ROLE_ORDER[minimum]) {
@@ -103,7 +124,7 @@ export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req,
       req.workspaceId = workspaceId;
       req.workspaceRole = role;
       req.workspacePlan = plan;
-      workspaceLimiter(req, res, next);
+      workspaceLimiter(req, res, (error) => (error ? next(error) : scope(req, res, next)));
     } catch (error) { next(error); }
   };
 
@@ -112,14 +133,39 @@ export function createAuth({ config, db, log, metrics, workspaceLimiter = (_req,
     const token = bearerToken(req);
     if (!token?.startsWith("wpg_")) return reject(req, res, "gateway", "missing_or_wrong_token_type", 401, "gateway_token_required");
     try {
-      const result = await db.query("SELECT g.id, g.workspace_id, g.name, g.labels, g.agent_version FROM gateways g JOIN workspaces w ON w.id = g.workspace_id WHERE g.token_hash = $1 AND g.revoked_at IS NULL AND (g.token_expires_at IS NULL OR g.token_expires_at > now()) AND w.deleted_at IS NULL", [sha256(token)]);
+      const result = await system.query("SELECT g.id, g.workspace_id, g.name, g.labels, g.agent_version FROM gateways g JOIN workspaces w ON w.id = g.workspace_id WHERE g.token_hash = $1 AND g.revoked_at IS NULL AND (g.token_expires_at IS NULL OR g.token_expires_at > now()) AND w.deleted_at IS NULL", [sha256(token)]);
       if (!result.rowCount) return reject(req, res, "gateway", "unknown_expired_or_revoked", 401, "invalid_gateway_token");
       req.gateway = result.rows[0];
+      onAuthSuccess(req);
       return next();
     } catch (error) { return next(error); }
   };
 
-  return { identity, requireRole, gatewayAuth };
+  // An identity provider's SCIM client authenticates with a workspace-scoped token (wps_) and may only manage that workspace's people.
+  // Failures answer in the SCIM error format, which is what such clients parse.
+  const scimAuth = async (req, res, next) => {
+    const refuse = async (reason) => {
+      await deny(req, "scim", reason);
+      return res.status(401).type("application/scim+json").send(JSON.stringify({ schemas: ["urn:ietf:params:scim:api:messages:2.0:Error"], status: "401", detail: "invalid_scim_token" }));
+    };
+    const token = bearerToken(req);
+    if (!token?.startsWith("wps_")) return refuse("missing_or_wrong_token_type");
+    try {
+      const hash = sha256(token);
+      const usable = "t.token_hash = $1 AND t.revoked_at IS NULL AND t.expires_at > now() AND w.deleted_at IS NULL";
+      // Throttled like API keys: one write a minute per token, not one per request.
+      let row = (await system.query(`UPDATE scim_tokens t SET last_used_at = now() FROM workspaces w WHERE w.id = t.workspace_id AND ${usable} AND (t.last_used_at IS NULL OR t.last_used_at < now() - interval '1 minute') RETURNING t.id, t.workspace_id, w.plan`, [hash])).rows[0];
+      if (!row) row = (await system.query(`SELECT t.id, t.workspace_id, w.plan FROM scim_tokens t JOIN workspaces w ON w.id = t.workspace_id WHERE ${usable}`, [hash])).rows[0];
+      if (!row) return refuse("unknown_expired_or_revoked");
+      req.identity = { kind: "scim", subject: `scim:${row.id}`, email: null, emailVerified: false };
+      req.workspaceId = row.workspace_id;
+      req.workspacePlan = row.plan;
+      onAuthSuccess(req);
+      return workspaceLimiter(req, res, next);
+    } catch (error) { return next(error); }
+  };
+
+  return { identity, requireRole, gatewayAuth, scimAuth, scope };
 }
 
 // Human-only: API keys cannot create workspaces or manage who has access.

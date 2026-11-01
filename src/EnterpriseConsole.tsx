@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  EnterpriseApiError, cancelTestJob, createApiKey, createWebhook, deleteWebhook, deleteWorkspace, fetchJobJunit, getWorkspacePlan, hasRole, inviteMember, listApiKeys, listGateways, listInvitations, listMembers,
-  listTestJobs, listWebhookDeliveries, listWebhooks, pingWebhook, redeliverWebhook, registerGateway, removeMember, revokeApiKey, revokeGateway, revokeInvitation, rotateGateway, rotateWebhookSecret,
-  setGatewayLabels, setMemberRole, streamTestJobs, updateWebhook,
-  type EnterpriseApiKey, type EnterpriseGateway, type EnterpriseInvitation, type EnterpriseMember, type EnterprisePlan, type EnterpriseTestJob, type EnterpriseWebhook, type EnterpriseWebhookDelivery,
+  EnterpriseApiError, cancelTestJob, createApiKey, createScimToken, createWebhook, deleteWebhook, deleteWorkspace, fetchAuditExport, fetchJobJunit, getWorkspacePlan, hasRole, inviteMember, listApiKeys, listAuditEvents, listGateways, listInvitations, listMembers, listProvisionedUsers, listScimTokens,
+  listTestJobs, listWebhookDeliveries, listWebhooks, pingWebhook, redeliverWebhook, registerGateway, removeMember, revokeApiKey, revokeGateway, revokeInvitation, revokeScimToken, rotateGateway, rotateWebhookSecret,
+  scimBaseUrl, setGatewayLabels, setMemberRole, streamTestJobs, updateWebhook, verifyAudit,
+  type AuditVerification, type EnterpriseApiKey, type EnterpriseAuditEvent, type EnterpriseGateway, type EnterpriseInvitation, type EnterpriseMember, type EnterprisePlan, type EnterpriseProvisionedUser, type EnterpriseScimToken, type ProvisionedState, type EnterpriseTestJob, type EnterpriseWebhook, type EnterpriseWebhookDelivery,
   type EnterpriseWorkspace, type PlanLimits, type Role, type StreamState, type WorkspaceUsage
 } from "./enterprise";
 
-type Tab = "jobs" | "gateways" | "team" | "keys" | "webhooks" | "usage";
+type Tab = "jobs" | "gateways" | "team" | "keys" | "provisioning" | "webhooks" | "audit" | "usage";
 type Secret = { title: string; hint: string; value: string };
 
 const ROLES: Role[] = ["viewer", "engineer", "maintainer", "administrator"];
@@ -18,7 +18,7 @@ const ERROR_TEXT: Record<string, string> = {
 };
 const STREAM_TEXT: Record<StreamState, string> = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting — refreshing every 10 s", denied: "Live updates refused for this credential — refreshing every 10 s" };
 
-const RESOURCE_TEXT: Record<string, string> = { members: "members", gateways: "gateways", api_keys: "API keys", webhooks: "webhooks", jobs_per_month: "jobs per month", reports_per_month: "reports per month" };
+const RESOURCE_TEXT: Record<string, string> = { members: "members", gateways: "gateways", api_keys: "API keys", scim_tokens: "provisioning tokens", webhooks: "webhooks", jobs_per_month: "jobs per month", reports_per_month: "reports per month" };
 const CODE_TEXT: Record<string, string> = {
   webhooks_not_configured: "Webhooks are not enabled on this server (the operator has not set a signing key).",
   confirmation_mismatch: "The name you typed does not match the workspace name.",
@@ -37,11 +37,14 @@ const USAGE_ROWS: Array<{ label: string; used: (usage: WorkspaceUsage) => number
   { label: "Members", used: (usage) => usage.members + usage.pendingInvitations, limit: "members", note: "including pending invitations" },
   { label: "Gateways", used: (usage) => usage.gateways, limit: "gateways" },
   { label: "API keys", used: (usage) => usage.apiKeys, limit: "apiKeys" },
+  { label: "Provisioning tokens", used: (usage) => usage.scimTokens, limit: "scimTokens" },
   { label: "Webhooks", used: (usage) => usage.webhooks, limit: "webhooks" },
   { label: "Queued jobs", used: (usage) => usage.queuedJobs, limit: "queuedJobs" },
   { label: "Jobs this month", used: (usage) => usage.jobsThisMonth, limit: "jobsPerMonth" },
   { label: "Reports this month", used: (usage) => usage.reportsThisMonth, limit: "reportsPerMonth" }
 ];
+const PROVISIONED_BADGE: Record<ProvisionedState, string> = { active: "passed", pending: "running", deactivated: "stopped" };
+const PROVISIONED_NOTE: Record<ProvisionedState, string> = { active: "has signed in", pending: "not signed in yet", deactivated: "access removed" };
 const DELIVERY_BADGE: Record<EnterpriseWebhookDelivery["status"], string> = { delivered: "passed", failed: "failed", pending: "running" };
 const ago = (iso: string | null | undefined) => {
   if (!iso) return "never";
@@ -51,6 +54,29 @@ const ago = (iso: string | null | undefined) => {
   if (seconds < 129_600) return `${Math.round(seconds / 3600)}h ago`;
   return `${Math.round(seconds / 86_400)}d ago`;
 };
+// What an administrator needs to know about a provisioning token before it silently stops working: after it expires, the identity
+// provider's requests are refused and leavers are no longer deprovisioned.
+const TOKEN_WARN_DAYS = 14;
+function tokenHealth(token: EnterpriseScimToken): { state: "revoked" | "expired" | "expiring" | "ok"; days: number } {
+  const days = Math.ceil((new Date(token.expiresAt).getTime() - Date.now()) / 86_400_000);
+  if (token.revokedAt) return { state: "revoked", days };
+  if (days <= 0) return { state: "expired", days };
+  return { state: days <= TOKEN_WARN_DAYS ? "expiring" : "ok", days };
+}
+// The audit filter is entered as whole UTC days; the server wants an inclusive start and an exclusive end.
+type AuditFilter = { action: string; from: string; to: string };
+const auditQuery = (filter: AuditFilter) => ({
+  action: filter.action.trim(),
+  from: filter.from ? `${filter.from}T00:00:00.000Z` : "",
+  to: filter.to ? new Date(Date.parse(`${filter.to}T00:00:00.000Z`) + 86_400_000).toISOString() : ""
+});
+const MAX_VERIFY_CALLS = 50;
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 const day = (iso: string | null | undefined) => iso ? new Date(iso).toLocaleDateString() : "never";
 const formatLabels = (labels: Record<string, string>) => Object.entries(labels).map(([key, value]) => `${key}=${value}`).join(", ");
 function parseLabels(text: string): Record<string, string> {
@@ -88,6 +114,13 @@ export function EnterpriseConsole({ apiUrl, token, workspace, onWorkspaceDeleted
   const [keyForm, setKeyForm] = useState<{ name: string; role: EnterpriseApiKey["role"]; days: string }>({ name: "", role: "engineer", days: "90" });
   const [plan, setPlan] = useState<EnterprisePlan | null>(null);
   const [deleteName, setDeleteName] = useState("");
+  const [scimTokens, setScimTokens] = useState<EnterpriseScimToken[]>([]);
+  const [provisioned, setProvisioned] = useState<EnterpriseProvisionedUser[]>([]);
+  const [scimForm, setScimForm] = useState({ name: "", days: "365" });
+  const [auditDraft, setAuditDraft] = useState<AuditFilter>({ action: "", from: "", to: "" });
+  const [audit, setAudit] = useState<{ events: EnterpriseAuditEvent[]; next: string | null; filter: AuditFilter } | null>(null);
+  const [auditOpen, setAuditOpen] = useState("");
+  const [verification, setVerification] = useState<(AuditVerification & { at: string }) | null>(null);
   const [webhooks, setWebhooks] = useState<EnterpriseWebhook[]>([]);
   const [webhooksOff, setWebhooksOff] = useState(false);
   const [hookForm, setHookForm] = useState({ name: "", url: "" });
@@ -126,6 +159,19 @@ export function EnterpriseConsole({ apiUrl, token, workspace, onWorkspaceDeleted
   const refreshKeys = useCallback(async () => {
     try { const list = await listApiKeys(apiUrl, token, workspaceId); if (mounted.current) setKeys(list); } catch (error) { if (mounted.current) setNotice(`Could not load API keys: ${describe(error)}`); }
   }, [apiUrl, token, workspaceId]);
+  const refreshProvisioning = useCallback(async () => {
+    try {
+      const [tokenList, userList] = await Promise.all([listScimTokens(apiUrl, token, workspaceId), listProvisionedUsers(apiUrl, token, workspaceId)]);
+      if (mounted.current) { setScimTokens(tokenList); setProvisioned(userList); }
+    } catch (error) { if (mounted.current) setNotice(`Could not load provisioning: ${describe(error)}`); }
+  }, [apiUrl, token, workspaceId]);
+  // Reads the first page for `filter`, or with a cursor the page after the ones already listed.
+  const loadAudit = useCallback(async (filter: AuditFilter, cursor?: string, previous: EnterpriseAuditEvent[] = []) => {
+    try {
+      const page = await listAuditEvents(apiUrl, token, workspaceId, { ...auditQuery(filter), ...(cursor ? { cursor } : {}) });
+      if (mounted.current) { setAudit({ events: [...previous, ...page.events], next: page.next, filter }); setAuditOpen(""); }
+    } catch (error) { if (mounted.current) setNotice(`Could not load the audit trail: ${describe(error)}`); }
+  }, [apiUrl, token, workspaceId]);
   const refreshPlan = useCallback(async () => {
     try { const fetched = await getWorkspacePlan(apiUrl, token, workspaceId); if (mounted.current) setPlan(fetched); } catch (error) { if (mounted.current) setNotice(`Could not load usage: ${describe(error)}`); }
   }, [apiUrl, token, workspaceId]);
@@ -155,22 +201,20 @@ export function EnterpriseConsole({ apiUrl, token, workspace, onWorkspaceDeleted
     if (tab === "gateways") { void refreshGateways(); const timer = setInterval(() => { void refreshGateways(); }, 15_000); return () => clearInterval(timer); }
     if (tab === "team" && can("maintainer")) void refreshTeam();
     if (tab === "keys" && can("administrator")) void refreshKeys();
+    if (tab === "provisioning" && can("administrator")) void refreshProvisioning();
+    if (tab === "audit" && can("administrator")) void loadAudit(auditDraft);
     if (tab === "usage") void refreshPlan();
     if (tab === "webhooks" && can("administrator")) void refreshWebhooks();
     return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, refreshGateways, refreshTeam, refreshKeys, refreshPlan, refreshWebhooks]);
+  }, [tab, refreshGateways, refreshTeam, refreshKeys, refreshProvisioning, refreshPlan, refreshWebhooks, loadAudit]);
 
   const gatewayName = (id: string | null) => id ? gateways.find((gateway) => gateway.id === id)?.name ?? id.slice(0, 8) : "";
-  const tabs: Array<[Tab, string, boolean]> = [["jobs", "Jobs", true], ["gateways", "Gateways", true], ["team", "Team", can("maintainer")], ["keys", "API keys", can("administrator")], ["webhooks", "Webhooks", can("administrator")], ["usage", "Usage", true]];
+  const tabs: Array<[Tab, string, boolean]> = [["jobs", "Jobs", true], ["gateways", "Gateways", true], ["team", "Team", can("maintainer")], ["keys", "API keys", can("administrator")], ["provisioning", "Provisioning", can("administrator")], ["webhooks", "Webhooks", can("administrator")], ["audit", "Audit", can("administrator")], ["usage", "Usage", true]];
 
   async function downloadJunit(job: EnterpriseTestJob) {
     await run("JUnit download", async () => {
-      const blob = await fetchJobJunit(apiUrl, token, workspaceId, job.id);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url; link.download = `wirepulse-${job.id.slice(0, 8)}.xml`; link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      saveBlob(await fetchJobJunit(apiUrl, token, workspaceId, job.id), `wirepulse-${job.id.slice(0, 8)}.xml`);
     });
   }
 
@@ -264,6 +308,30 @@ export function EnterpriseConsole({ apiUrl, token, workspace, onWorkspaceDeleted
       </li>)}</ul>}
     </div>}
 
+    {tab === "provisioning" && can("administrator") && <div>
+      <p className="ec-help">Provisioning lets your identity provider (Okta, Microsoft Entra ID, or any SCIM 2.0 client) add and remove people here, so someone deactivated there loses access to this workspace within seconds, including any open live view. People are matched to their sign-in by verified email on their first sign-in; use roles named exactly viewer, engineer, maintainer or administrator. SCIM Groups keep directory membership in sync but do not grant workspace access or change roles.</p>
+      <div className="ec-row"><b>SCIM base URL</b><code data-testid="scim-base-url">{scimBaseUrl(apiUrl)}</code><button onClick={() => void navigator.clipboard?.writeText(scimBaseUrl(apiUrl))}>Copy</button></div>
+      <form className="ec-form" onSubmit={(event) => { event.preventDefault(); void run("Create token", async () => { const created = await createScimToken(apiUrl, token, workspaceId, scimForm.name.trim(), Number(scimForm.days) || undefined); setSecret({ title: `Provisioning token “${created.name}” created`, hint: `Paste it into your identity provider as the bearer token. It expires ${day(created.expiresAt)}; after that the provider is refused and leavers are no longer removed, so create a replacement before then. It is shown once.`, value: created.token }); setScimForm({ ...scimForm, name: "" }); setNotice(""); await refreshProvisioning(); }); }}>
+        <label>Name<input required maxLength={120} value={scimForm.name} onChange={(event) => setScimForm({ ...scimForm, name: event.target.value })} placeholder="okta-production" /></label>
+        <label>Lifetime (days)<input type="number" min={1} max={3650} value={scimForm.days} onChange={(event) => setScimForm({ ...scimForm, days: event.target.value })} /></label>
+        <button type="submit" disabled={busy || !scimForm.name.trim()}>Create token</button>
+      </form>
+      <h3>Tokens</h3>
+      {scimTokens.length === 0 ? <p className="ec-empty">No provisioning tokens.</p> : <ul className="ec-list">{scimTokens.map((scim) => { const health = tokenHealth(scim); return <li className="ec-job" key={scim.id}>
+        <div className="ec-row"><b>{scim.name}</b><code>{scim.prefix}…</code><span className={`ec-badge ${health.state === "ok" ? "passed" : health.state === "expiring" ? "running" : health.state === "expired" ? "failed" : "cancelled"}`} data-testid="scim-token-state">{health.state}</span>
+          <small>{health.state === "revoked" ? "revoked" : health.state === "expired" ? `expired ${day(scim.expiresAt)}` : `expires ${day(scim.expiresAt)} (${health.days} d)`} · last used {ago(scim.lastUsedAt)}</small>
+          {!scim.revokedAt && <button className="danger" disabled={busy} onClick={() => { if (window.confirm(`Revoke the token “${scim.name}”? Your identity provider is refused immediately and stops adding or removing people until it is given a new token.`)) void run("Revoke token", async () => { await revokeScimToken(apiUrl, token, workspaceId, scim.id); await refreshProvisioning(); }); }}>Revoke</button>}</div>
+        {(health.state === "expired" || health.state === "expiring") && <span className="ec-error" role="alert">{health.state === "expired" ? "This token has expired: the identity provider can no longer remove leavers. Create a new token and give it to the provider, then revoke this one." : `This token expires in ${health.days} day${health.days === 1 ? "" : "s"}. Create a replacement and update the identity provider before then.`}</span>}
+        {health.state !== "revoked" && health.state !== "expired" && !scim.lastUsedAt && <small>Never used: the identity provider has not connected with it yet.</small>}
+      </li>; })}</ul>}
+      {scimTokens.length > 0 && !scimTokens.some((scim) => tokenHealth(scim).state === "ok" || tokenHealth(scim).state === "expiring") && <p className="ec-error" role="alert">No usable token: provisioning and deprovisioning from the identity provider are not working.</p>}
+      <div className="ec-row"><h3>Provisioned people</h3><button onClick={() => void refreshProvisioning()}>Refresh</button></div>
+      {provisioned.length === 0 ? <p className="ec-empty">Nobody has been provisioned yet.</p> : <ul className="ec-list">{provisioned.map((person) => <li className="ec-job" key={person.id}>
+        <div className="ec-row"><b>{person.displayName ?? person.userName}</b><small>{person.email ?? person.userName}</small><span className="ec-badge stopped">{person.role}</span><span className={`ec-badge ${PROVISIONED_BADGE[person.state]}`} data-testid="provisioned-state">{person.state}</span><small>{PROVISIONED_NOTE[person.state]}{person.state === "deactivated" && person.deactivatedAt ? ` ${ago(person.deactivatedAt)}` : ""}</small></div>
+      </li>)}</ul>}
+      <p className="ec-help">Deactivating someone in the identity provider removes their membership here and revokes the API keys they created. A key made by a person who is still here is left alone.</p>
+    </div>}
+
     {tab === "webhooks" && can("administrator") && <div>
       <p className="ec-help">A webhook sends a signed HTTP POST to your system when a job finishes. Deliveries are retried and arrive at least once: ignore a repeated X-WirePulse-Delivery id. Verify the X-WirePulse-Signature header with the secret, which is shown once.</p>
       {webhooksOff ? <p className="ec-empty">Webhooks are not enabled on this server. The operator turns them on by setting a signing key.</p> : <>
@@ -293,6 +361,43 @@ export function EnterpriseConsole({ apiUrl, token, workspace, onWorkspaceDeleted
           </li>)}</ul>)}
         </li>)}</ul>}
       </>}
+    </div>}
+
+    {tab === "audit" && can("administrator") && <div>
+      <p className="ec-help">Every change to this workspace (who, what, when, from where) is recorded in a trail whose entries are chained by hash, so an edit or deletion after the fact is detectable. “Verify” recomputes the chain on the server. To also catch someone with direct database access rewriting the end of the trail, keep the head hash somewhere they cannot write to, and archive the export.</p>
+      <div className="ec-row">
+        <button disabled={busy} onClick={() => void run("Verify", async () => {
+          let from = 0; let checked = 0; let result = await verifyAudit(apiUrl, token, workspaceId, from);
+          for (let calls = 1; ; calls += 1) {
+            checked += result.checked;
+            if (!result.valid || result.complete || result.nextFromSeq === null || calls >= MAX_VERIFY_CALLS) break;
+            from = result.nextFromSeq; result = await verifyAudit(apiUrl, token, workspaceId, from);
+          }
+          setVerification({ ...result, checked, at: new Date().toISOString() });
+        })}>Verify chain</button>
+        <button disabled={busy} onClick={() => void run("Export", async () => { saveBlob(await fetchAuditExport(apiUrl, token, workspaceId), `wirepulse-audit-${workspaceId.slice(0, 8)}.ndjson`); })}>Export (NDJSON)</button>
+      </div>
+      {verification && (verification.valid
+        ? <div className="ec-secret" role="status" data-testid="audit-verification"><b>Chain intact</b><p>{verification.checked} event{verification.checked === 1 ? "" : "s"} checked{verification.lastSeq === null ? "" : `, up to #${verification.lastSeq}`}{verification.complete ? "" : " (stopped early; verify again to continue)"} · {new Date(verification.at).toLocaleTimeString()}</p>{verification.headHash && <p>Head hash <code data-testid="audit-head-hash">{verification.headHash}</code> <button onClick={() => void navigator.clipboard?.writeText(verification.headHash ?? "")}>Copy</button></p>}</div>
+        : <div className="ec-secret" role="alert" data-testid="audit-verification"><b>Chain broken</b><p>The first entry that does not match is #{verification.firstBadSeq}. Treat this as a security incident: preserve the database and the latest export.</p></div>)}
+      <form className="ec-form" onSubmit={(event) => { event.preventDefault(); void run("Filter", () => loadAudit(auditDraft)); }}>
+        <label>Action (exact)<input value={auditDraft.action} maxLength={80} onChange={(event) => setAuditDraft({ ...auditDraft, action: event.target.value })} placeholder="gateway.revoked" /></label>
+        <label>From (UTC date)<input type="date" value={auditDraft.from} onChange={(event) => setAuditDraft({ ...auditDraft, from: event.target.value })} /></label>
+        <label>To (UTC date, inclusive)<input type="date" value={auditDraft.to} onChange={(event) => setAuditDraft({ ...auditDraft, to: event.target.value })} /></label>
+        <button type="submit" disabled={busy}>Apply filter</button>
+      </form>
+      {!audit ? <p className="ec-empty">Loading the audit trail…</p> : audit.events.length === 0 ? <p className="ec-empty">No audit events match.</p> : <ul className="ec-list">{audit.events.map((event) => <li className="ec-job" key={event.id}>
+        <div className="ec-row"><code>#{event.chain_seq}</code><b>{event.action}</b><small>{event.actor_subject ?? "—"}{event.resource_type ? ` · ${event.resource_type}${event.resource_id ? ` ${event.resource_id.slice(0, 8)}` : ""}` : ""} · {ago(event.created_at)}</small>
+          <button aria-expanded={auditOpen === event.id} onClick={() => setAuditOpen(auditOpen === event.id ? "" : event.id)}>{auditOpen === event.id ? "Hide details" : "Details"}</button></div>
+        {auditOpen === event.id && <dl className="ec-details">
+          <dt>Time</dt><dd>{new Date(event.created_at).toLocaleString()}</dd>
+          <dt>Request / address</dt><dd>{event.request_id ?? "—"} / {event.ip_address ?? "—"}</dd>
+          <dt>Details</dt><dd><code>{JSON.stringify(event.details)}</code></dd>
+          <dt>Previous hash</dt><dd><code>{event.prev_hash}</code></dd>
+          <dt>Entry hash</dt><dd><code>{event.row_hash}</code></dd>
+        </dl>}
+      </li>)}</ul>}
+      {audit?.next && <div className="ec-actions"><button disabled={busy} onClick={() => void run("Load older", () => loadAudit(audit.filter, audit.next ?? undefined, audit.events))}>Load older events</button></div>}
     </div>}
 
     {tab === "usage" && <div>

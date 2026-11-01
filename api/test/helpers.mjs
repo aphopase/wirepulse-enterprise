@@ -67,8 +67,8 @@ export async function startIssuer() {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const issuer = `http://127.0.0.1:${server.address().port}`;
-  async function sign({ sub = "user-1", email, emailVerified = true, aud = AUDIENCE, iss = issuer, exp = "5m", signWith = privateKey, alg = "RS256" } = {}) {
-    const claims = {};
+  async function sign({ sub = "user-1", email, emailVerified = true, aud = AUDIENCE, iss = issuer, exp = "5m", signWith = privateKey, alg = "RS256", claims: extra = {} } = {}) {
+    const claims = { ...extra };
     if (email !== undefined) { claims.email = email; claims.email_verified = emailVerified; }
     return new SignJWT(claims).setProtectedHeader({ alg, kid: "test-key" }).setSubject(sub).setIssuer(iss).setAudience(aud).setIssuedAt().setExpirationTime(exp).sign(signWith);
   }
@@ -88,12 +88,13 @@ export async function startApi({ databaseUrl, env = {}, issuer } = {}) {
     ...env
   });
   const log = createLogger({ level: config.logLevel, destination });
-  const db = createDatabase({ url: config.databaseUrl, poolSize: config.db.poolSize, ssl: config.db.ssl, statementTimeoutMs: config.db.statementTimeoutMs, idleTxTimeoutMs: config.db.idleTxTimeoutMs, connectTimeoutMs: config.db.connectTimeoutMs, log });
-  await migrate(db, { log });
+  const db = createDatabase({ url: config.databaseUrl, listenUrl: config.listenDatabaseUrl, poolSize: config.db.poolSize, ssl: config.db.ssl, statementTimeoutMs: config.db.statementTimeoutMs, idleTxTimeoutMs: config.db.idleTxTimeoutMs, connectTimeoutMs: config.db.connectTimeoutMs, rowLevelSecurity: config.db.rowLevelSecurity, log });
+  await migrate(db.system, { log });
   const instance = createApp({ config, db, log });
   const { port } = await instance.start();
   return {
-    url: `http://127.0.0.1:${port}`, config, db, instance, log,
+    // db is the unrestricted connection tests use to seed and inspect; restricted is what the request handlers themselves run on.
+    url: `http://127.0.0.1:${port}`, config, db: db.system, restricted: db, instance, log,
     logs: () => lines.join(""),
     logEntries: () => lines.join("").split("\n").filter(Boolean).map((line) => JSON.parse(line)),
     stop: () => instance.shutdown({ graceMs: 1000 })

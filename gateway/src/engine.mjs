@@ -69,14 +69,20 @@ export async function runSuite({ tests, profile = {}, transport, signal, onProgr
       results[index].attempts = attempt;
       const startRxSequence = transport.rxSequence();
       ledger.append("attempt.started", { testId: results[index].testId, attempt, timeoutMs, retries, responseStartRxSequence: startRxSequence });
-      for (const command of String(test.commands ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      // The window opens just before the last command is written, not after: a fast device (USB CDC, a pseudo-terminal) can answer while
+      // send() is still draining, and a reply that arrives before anyone listens would be lost. Data from before the write stays stale.
+      const arm = () => { const window = { startAt: Date.now(), startRxSequence: transport.rxSequence() }; return { window, outcome: waitForResponse(transport, test, window, timeoutMs, signal) }; };
+      const commands = String(test.commands ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+      let armed = null;
+      for (const [position, command] of commands.entries()) {
+        if (position === commands.length - 1) armed = arm();
         const receipt = await transport.send(command);
         ledger.append("command.transmitted", { testId: results[index].testId, attempt, commandSequence: receipt.sequence, byteLength: receipt.byteLength, transmittedAt: receipt.at });
       }
-      const startAt = Date.now();
-      const window = { startAt, startRxSequence: transport.rxSequence() };
-      ledger.append("response.window.opened", { testId: results[index].testId, attempt, startAt, startRxSequence: window.startRxSequence, deadline: startAt + timeoutMs });
-      const outcome = await waitForResponse(transport, test, window, timeoutMs, signal);
+      armed ??= arm();
+      const { startAt, startRxSequence: windowRxSequence } = armed.window;
+      ledger.append("response.window.opened", { testId: results[index].testId, attempt, startAt, startRxSequence: windowRxSequence, deadline: startAt + timeoutMs });
+      const outcome = await armed.outcome;
       if (signal?.aborted) { stopped = true; break; }
       if (!outcome.matched) ledger.append("attempt.timed_out", { testId: results[index].testId, attempt, deadline: startAt + timeoutMs, staleLinesRejected: outcome.stale });
       if (outcome.matched || attempt > retries) {

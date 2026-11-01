@@ -81,6 +81,31 @@ test("rejected credentials are counted across instances, and valid requests in f
   } finally { await second.stop(); await first.stop(); }
 });
 
+test("a locked address still serves a credential another instance verified, and only that one", { skip }, async () => {
+  await clearLimiterKeys();
+  const first = await startShared(REDIS_URL, { AUTH_FAILURE_LIMIT_PER_MINUTE: "3" });
+  const second = await startShared(REDIS_URL, { AUTH_FAILURE_LIMIT_PER_MINUTE: "3" });
+  try {
+    const operator = createClient(first.url, DEV_TOKEN);
+    const workspaceId = (await operator("/v1/workspaces", { method: "POST", body: { name: "shared-nat" } })).body.id;
+    const make = async (name) => (await operator(`${ws(workspaceId)}/api-keys`, { method: "POST", body: { name, role: "viewer" } })).body;
+    const colleague = await make("colleague"); const stranger = await make("not-yet-used");
+    const list = (app, token) => createClient(app.url, token)(`${ws(workspaceId)}/gateways`);
+    assert.equal((await list(first, colleague.token)).status, 200);
+    await waitFor(async () => (await redis.keys("wirepulse:rl:verified:*")).length >= 2, { message: "the verified credentials to be shared" });
+    assert.ok(!(await redis.keys("wirepulse:rl:verified:*")).join().includes(colleague.token), "Redis holds a hash, never the credential");
+
+    const guesses = []; for (let i = 0; i < 5; i++) guesses.push((await createClient(second.url, `guess-${i}`)("/v1/workspaces")).status);
+    assert.deepEqual(guesses, [401, 401, 401, 429, 429], "the shared address is locked");
+    assert.equal((await list(second, colleague.token)).status, 200, "the second instance accepts what the first verified");
+    assert.equal((await list(second, stranger.token)).status, 429, "a valid credential nobody has verified yet waits out the window");
+    assert.equal((await createClient(second.url, "guess-again")("/v1/workspaces")).status, 429, "and the guesser stays locked");
+
+    assert.equal((await operator(`${ws(workspaceId)}/api-keys/${colleague.id}`, { method: "DELETE" })).status < 300, true);
+    assert.equal((await list(second, colleague.token)).status, 401, "a credential revoked after it was shared fails the full check");
+  } finally { await second.stop(); await first.stop(); }
+});
+
 test("a workspace's request budget is shared across instances", { skip }, async () => {
   await clearLimiterKeys();
   const first = await startShared(REDIS_URL, { DEFAULT_PLAN: "free" });

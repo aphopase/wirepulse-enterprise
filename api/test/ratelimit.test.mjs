@@ -12,7 +12,7 @@ function limiters(limit) {
 const attempt = (limiter, ip = "203.0.113.9") => new Promise((resolve) => {
   const headers = {};
   const res = { set: (name, value) => { headers[name] = value; return res; }, status: (code) => ({ json: () => resolve({ status: code, headers }) }) };
-  limiter({ ip, log: { warn: noop } }, res, () => resolve({ status: "next", headers }));
+  limiter({ ip, get: () => undefined, log: { warn: noop } }, res, () => resolve({ status: "next", headers }));
 });
 
 test("an address that used its failure budget is let back in when the window ends", async () => {

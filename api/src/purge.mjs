@@ -2,7 +2,7 @@ import { audit } from "./db.mjs";
 
 // Everything a workspace owns, children before parents. The audit trail (audit_events, audit_anchors) is not here: it is append-only
 // evidence and outlives the content, attached to the workspace row that stays behind as a tombstone.
-const TABLES = ["outbox", "webhooks", "test_reports", "test_jobs", "resource_versions", "test_suites", "shared_profiles", "gateways", "api_keys", "workspace_invitations", "workspace_members", "workspace_usage"];
+const TABLES = ["outbox", "webhooks", "test_reports", "test_jobs", "resource_versions", "test_suites", "shared_profiles", "gateways", "api_keys", "scim_group_members", "scim_groups", "scim_users", "scim_tokens", "workspace_invitations", "workspace_members", "workspace_usage"];
 const BATCH = 1000;
 const MAX_SLICES = 50;
 const MAX_WORKSPACES = 10;

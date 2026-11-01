@@ -46,7 +46,7 @@ test("a new workspace takes the default plan and /usage reports plan, limits and
   assert.equal(empty.status, 200); assert.equal(empty.body.plan, "free"); assert.deepEqual(empty.body.limits, PLANS.free);
   assert.match(empty.body.usage.period, /^\d{4}-\d{2}-01$/);
   const { period, ...counts } = empty.body.usage;
-  assert.deepEqual(counts, { members: 1, pendingInvitations: 0, gateways: 0, apiKeys: 0, webhooks: 0, queuedJobs: 0, jobsThisMonth: 0, reportsThisMonth: 0 });
+  assert.deepEqual(counts, { members: 1, pendingInvitations: 0, gateways: 0, apiKeys: 0, webhooks: 0, scimTokens: 0, queuedJobs: 0, jobsThisMonth: 0, reportsThisMonth: 0 });
 
   const key = (await admin(`${ws(workspaceId)}/api-keys`, { method: "POST", body: { name: "viewer", role: "viewer" } })).body;
   assert.equal((await admin(`${ws(workspaceId)}/gateways`, { method: "POST", body: { name: "lab" } })).status, 201);
@@ -54,7 +54,7 @@ test("a new workspace takes the default plan and /usage reports plan, limits and
   const viewer = createClient(api.url, key.token);
   const seen = await viewer(`${ws(workspaceId)}/usage`);
   assert.equal(seen.status, 200, "any member role can read usage");
-  assert.deepEqual({ ...seen.body.usage, period: undefined }, { period: undefined, members: 1, pendingInvitations: 0, gateways: 1, apiKeys: 1, webhooks: 0, queuedJobs: 1, jobsThisMonth: 1, reportsThisMonth: 0 });
+  assert.deepEqual({ ...seen.body.usage, period: undefined }, { period: undefined, members: 1, pendingInvitations: 0, gateways: 1, apiKeys: 1, webhooks: 0, scimTokens: 0, queuedJobs: 1, jobsThisMonth: 1, reportsThisMonth: 0 });
 
   assert.equal((await createClient(api.url, null)(`${ws(workspaceId)}/usage`)).status, 401);
   const stranger = await as("not-a-member", { email: "x@example.com" });

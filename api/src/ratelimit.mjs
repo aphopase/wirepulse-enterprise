@@ -1,6 +1,8 @@
+import crypto from "node:crypto";
 import rateLimit, { MemoryStore } from "express-rate-limit";
 import { RedisStore } from "rate-limit-redis";
 import { createClient } from "redis";
+import { bearerToken } from "./auth.mjs";
 import { limitsFor } from "./plans.mjs";
 
 // IPv6 clients are limited per /64 so rotating addresses inside one allocation does not bypass the limit. The address is expanded first:
@@ -33,6 +35,9 @@ class ResilientStore {
   }
   shutdown() { this.local.shutdown?.(); }
 }
+
+const VERIFIED_TTL_MS = 5 * 60_000;
+const VERIFIED_MAX = 10_000;
 
 export function createRateLimiters({ config, metrics, log }) {
   let redis = null;
@@ -74,10 +79,26 @@ export function createRateLimiters({ config, metrics, log }) {
   const failureStore = storeFor("auth_failure") ?? new MemoryStore();
   failureStore.init({ windowMs: 60_000 });
   const rejectTooMany = tooMany("auth_failure");
+  // Credentials verified in the last few minutes (by hash, never the token). A locked address still gets these through the guess throttle,
+  // so one person guessing from a shared address (an office NAT) does not lock out the colleagues who are already signed in. Only the
+  // throttle is skipped: the credential is checked in full right after, and a revoked one fails that check and is counted. Each replica
+  // remembers what it verified itself and, with Redis, what the others verified; a credential no replica has seen recently is refused like
+  // any other until the window ends. Best effort: without Redis, or while it is down, only this replica's own list counts.
+  const verified = new Map();
+  const sharedKey = (key) => `wirepulse:rl:verified:${key}`;
+  const credentialKey = (req) => { const token = bearerToken(req); return token ? crypto.createHash("sha256").update(token).digest("base64") : null; };
+  const wasVerified = async (req) => {
+    const key = credentialKey(req);
+    if (key === null) return false;
+    if ((verified.get(key)?.until ?? 0) > Date.now()) return true;
+    if (!redis?.isReady) return false;
+    try { return (await redis.exists(sharedKey(key))) === 1; } catch { return false; }
+  };
   const authFailure = async (req, res, next) => {
     try {
       const seen = await failureStore.get(ipKey(req.ip));
       if (seen && seen.totalHits >= config.limits.authFailurePerMinute && seen.resetTime > new Date()) {
+        if (await wasVerified(req)) return next();
         res.set("Retry-After", String(Math.max(1, Math.ceil((seen.resetTime - Date.now()) / 1000))));
         return rejectTooMany(req, res);
       }
@@ -85,6 +106,18 @@ export function createRateLimiters({ config, metrics, log }) {
     } catch (error) { next(error); }
   };
   authFailure.record = (req) => Promise.resolve(failureStore.increment(ipKey(req.ip))).catch(() => {});
+  authFailure.succeed = (req) => {
+    const key = credentialKey(req);
+    if (key === null) return;
+    const now = Date.now();
+    const sharedAt = verified.get(key)?.sharedAt ?? 0;
+    verified.delete(key); // re-inserted last, so the oldest entries are the first dropped when the map is full
+    if (verified.size >= VERIFIED_MAX) verified.delete(verified.keys().next().value);
+    // Written to Redis at most once a minute per credential, so most requests cost no extra Redis call.
+    const share = redis?.isReady && now - sharedAt > 60_000;
+    if (share) redis.set(sharedKey(key), "1", { PX: VERIFIED_TTL_MS }).catch(() => {});
+    verified.set(key, { until: now + VERIFIED_TTL_MS, sharedAt: share ? now : sharedAt });
+  };
 
   return {
     ip: limiter("ip", { limit: config.limits.ipPerMinute, keyGenerator: (req) => ipKey(req.ip) }),

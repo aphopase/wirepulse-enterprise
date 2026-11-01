@@ -54,7 +54,7 @@ function verify(method, requestPath, response) {
   const actual = (response.headers.get("content-type") ?? "").split(";")[0].trim();
   assert.ok(mediaTypes.includes(actual), `${label(item)} ${response.status}: content type ${actual} is not one of ${mediaTypes.join(", ") || "(none documented)"}`);
   const schema = documented.content[actual]?.schema;
-  if (actual === "application/json" && schema) {
+  if (["application/json", "application/scim+json"].includes(actual) && schema) {
     const validate = validatorFor(schema);
     assert.ok(validate(response.body), `${label(item)} ${response.status} does not match its schema: ${JSON.stringify(validate.errors?.slice(0, 3))} in ${response.text.slice(0, 300)}`);
   }
@@ -83,7 +83,7 @@ test("the document describes exactly the routes the server registers", async () 
 });
 
 test("every operation is described completely and consistently", () => {
-  const PROBES = new Set(["/healthz", "/readyz", "/metrics"]);
+  const PROBES = new Set(["/healthz", "/readyz", "/metrics", "/auth/config"]);
   const ROLES = ["viewer", "engineer", "maintainer", "administrator"];
   for (const item of operations) {
     const { operation, template } = item;
@@ -93,10 +93,13 @@ test("every operation is described completely and consistently", () => {
     assert.ok(statuses.some((status) => status.startsWith("2")), `${label(item)} has no success response`);
     if (PROBES.has(template)) continue;
     assert.ok(statuses.includes("401") && statuses.includes("429"), `${label(item)} must document 401 and 429`);
+    const scim = template.startsWith("/scim/v2/");
     if (template.startsWith("/gateway/v1/")) assert.deepEqual(operation.security, [{ gatewayAuth: [] }], `${label(item)} is a gateway operation`);
+    else if (scim) assert.deepEqual(operation.security, [{ scimAuth: [] }], `${label(item)} is an identity-provider operation`);
     else assert.ok(ROLES.includes(operation["x-required-role"]) || ["any member", "authenticated human"].includes(operation["x-required-role"]), `${label(item)} needs x-required-role`);
     if (template.includes("{workspaceId}")) assert.ok(ROLES.includes(operation["x-required-role"]) && statuses.includes("403"), `${label(item)} is workspace-scoped: a role and the 403 for callers outside it`);
-    if (/\{(workspaceId|id)\}/.test(template)) assert.ok(statuses.includes("400"), `${label(item)} must document 400 (invalid_identifier)`);
+    // SCIM answers an unusable id with 404, as RFC 7644 asks, and documents its own 400s (invalid bodies and filters).
+    if (/\{(workspaceId|id)\}/.test(template) && !scim) assert.ok(statuses.includes("400"), `${label(item)} must document 400 (invalid_identifier)`);
   }
 });
 
@@ -124,9 +127,9 @@ const MISSING = "00000000-0000-4000-8000-000000000000";
 test("workspaces, shared profiles and suites answer as documented", { skip }, async () => {
   await expectStatus(call(anonymous, "GET", "/healthz"), 200);
   await expectStatus(call(anonymous, "GET", "/readyz"), 200);
+  await expectStatus(call(anonymous, "GET", "/auth/config"), 200);
   await expectStatus(call(anonymous, "GET", "/metrics"), 200);
   await expectStatus(call(anonymous, "GET", "/v1/workspaces"), 401);
-
   const workspaceId = (await expectStatus(call(admin, "POST", "/v1/workspaces", { body: { name: "contract" } }), 201)).body.id;
   await expectStatus(call(admin, "POST", "/v1/workspaces", { body: {} }), 400);
   await expectStatus(call(admin, "GET", "/v1/workspaces"), 200);
@@ -407,6 +410,95 @@ test("offboarding a workspace answers as documented", { skip }, async () => {
   const done = await expectStatus(call(admin, "DELETE", `${ws(workspaceId)}?confirm=contract%20offboard`), 200);
   assert.equal(done.body.id, workspaceId);
   await expectStatus(call(admin, "DELETE", `${ws(workspaceId)}?confirm=contract%20offboard`), 403);
+});
+
+test("provisioning (SCIM) answers as documented", { skip }, async () => {
+  const workspaceId = (await admin("/v1/workspaces", { method: "POST", body: { name: "scim contract" } })).body.id;
+  const base = `${ws(workspaceId)}/scim`;
+  // The free plan has no SCIM tokens (new workspaces start on the deployment's default plan, so say which): check the refusal, then move to a plan with room.
+  await api.db.query("UPDATE workspaces SET plan = 'free' WHERE id = $1", [workspaceId]);
+  await expectStatus(call(admin, "POST", `${base}/tokens`, { body: { name: "okta" } }), 403);
+  await api.db.query("UPDATE workspaces SET plan = 'business' WHERE id = $1", [workspaceId]);
+  await expectStatus(call(admin, "POST", `${base}/tokens`, { body: { name: "okta", expiresInDays: 0 } }), 400);
+  const issued = (await expectStatus(call(admin, "POST", `${base}/tokens`, { body: { name: "okta", expiresInDays: 30 } }), 201)).body;
+  assert.match(issued.token, /^wps_/);
+  const doomed = (await expectStatus(call(admin, "POST", `${base}/tokens`, { body: { name: "spare" } }), 201)).body;
+  assert.deepEqual((await expectStatus(call(admin, "GET", `${base}/tokens`), 200)).body.map((token) => token.token), [undefined, undefined], "the secret is shown once");
+  await expectStatus(call(admin, "DELETE", `${base}/tokens/${doomed.id}`), 204);
+  await expectStatus(call(admin, "DELETE", `${base}/tokens/${doomed.id}`), 404);
+
+  const idp = createClient(api.url, issued.token);
+  const scimHeaders = { "content-type": "application/scim+json" };
+  const refused = await expectStatus(call(createClient(api.url, doomed.token), "GET", "/scim/v2/Users"), 401);
+  assert.equal(refused.headers.get("content-type").split(";")[0], "application/scim+json");
+  await expectStatus(call(anonymous, "GET", "/scim/v2/Users"), 401);
+  await expectStatus(call(createClient(api.url, DEV_TOKEN), "GET", "/scim/v2/Users"), 401);
+
+  for (const discovery of ["ServiceProviderConfig", "ResourceTypes", "Schemas"]) await expectStatus(call(idp, "GET", `/scim/v2/${discovery}`), 200);
+  await expectStatus(call(idp, "GET", "/scim/v2/ResourceTypes/User"), 200);
+  await expectStatus(call(idp, "GET", "/scim/v2/ResourceTypes/Group"), 200);
+  await expectStatus(call(idp, "GET", "/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2.0:User"), 200);
+  await expectStatus(call(idp, "GET", "/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group"), 200);
+  await expectStatus(call(idp, "GET", "/scim/v2/Schemas/urn:nope"), 404);
+  for (const searchPath of ["/scim/v2/Users/.search", "/scim/v2/.search"]) {
+    await expectStatus(call(idp, "POST", searchPath, { body: { schemas: ["urn:ietf:params:scim:api:messages:2.0:SearchRequest"], count: 1 } }), 200);
+    await expectStatus(call(idp, "POST", searchPath, { body: { filter: "displayName sw P" } }), 400);
+  }
+  await expectStatus(call(anonymous, "POST", "/scim/v2/Users/.search", { body: {} }), 401);
+
+  const created = (await expectStatus(call(idp, "POST", "/scim/v2/Users", { headers: scimHeaders, body: { schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], userName: "pat@example.com", externalId: "okta-1", displayName: "Pat Doe", name: { givenName: "Pat", familyName: "Doe" }, emails: [{ value: "pat@example.com", type: "work", primary: true }], roles: [{ value: "engineer" }], active: true } }), 201)).body;
+  assert.equal(created.roles[0].value, "engineer");
+  await expectStatus(call(idp, "POST", "/scim/v2/Users", { body: { userName: "pat@example.com" } }), 409);
+  await expectStatus(call(idp, "POST", "/scim/v2/Users", { body: {} }), 400);
+  await expectStatus(call(idp, "POST", "/scim/v2/Users", { body: { userName: "lee@example.com", roles: [{ value: "emperor" }] } }), 400);
+  await expectStatus(call(idp, "POST", "/scim/v2/Users", { rawBody: "{", headers: scimHeaders }), 400);
+  const lee = (await expectStatus(call(idp, "POST", "/scim/v2/Users", { body: { userName: "lee@example.com", active: false } }), 201)).body;
+  assert.equal(lee.active, false);
+
+  const group = (await expectStatus(call(idp, "POST", "/scim/v2/Groups", { body: { displayName: "Hardware", externalId: "okta-hardware", members: [{ value: created.id }] } }), 201)).body;
+  assert.equal((await expectStatus(call(idp, "GET", "/scim/v2/Groups"), 200)).body.totalResults, 1);
+  assert.equal((await expectStatus(call(idp, "GET", `/scim/v2/Groups?filter=${encodeURIComponent('displayName eq "Hardware"')}`), 200)).body.Resources[0].id, group.id);
+  assert.equal((await expectStatus(call(idp, "POST", "/scim/v2/Groups/.search", { body: { filter: 'externalId eq "okta-hardware"' } }), 200)).body.Resources[0].id, group.id);
+  assert.equal((await expectStatus(call(idp, "GET", `/scim/v2/Groups/${group.id}`), 200)).body.members[0].value, created.id);
+  const replacedGroup = (await expectStatus(call(idp, "PUT", `/scim/v2/Groups/${group.id}`, { body: { displayName: "Lab" } }), 200)).body;
+  assert.equal(replacedGroup.members, undefined);
+  assert.equal((await expectStatus(call(idp, "PATCH", `/scim/v2/Groups/${group.id}`, { body: { Operations: [{ op: "Replace", path: "displayName", value: "Lab hardware" }] } }), 200)).body.displayName, "Lab hardware");
+  await expectStatus(call(idp, "DELETE", `/scim/v2/Groups/${group.id}`), 204);
+
+  assert.equal((await expectStatus(call(idp, "GET", "/scim/v2/Users"), 200)).body.totalResults, 2);
+  assert.equal((await expectStatus(call(idp, "GET", `/scim/v2/Users?filter=${encodeURIComponent('userName eq "pat@example.com"')}`), 200)).body.Resources[0].id, created.id);
+  assert.equal((await expectStatus(call(idp, "GET", "/scim/v2/Users?startIndex=2&count=1"), 200)).body.Resources.length, 1);
+  await expectStatus(call(idp, "GET", `/scim/v2/Users?filter=${encodeURIComponent("displayName sw P")}`), 400);
+  assert.equal((await expectStatus(call(idp, "GET", `/scim/v2/Users/${created.id}`), 200)).body.userName, "pat@example.com");
+  await expectStatus(call(idp, "GET", `/scim/v2/Users/${MISSING}`), 404);
+  await expectStatus(call(idp, "GET", "/scim/v2/Users/not-a-uuid"), 404);
+
+  const replaced = (await expectStatus(call(idp, "PUT", `/scim/v2/Users/${created.id}`, { body: { userName: "pat@example.com", displayName: "Pat D.", emails: [{ value: "pat@example.com", primary: true }] } }), 200)).body;
+  assert.equal(replaced.displayName, "Pat D."); assert.equal(replaced.roles[0].value, "engineer", "roles stay when omitted");
+  await expectStatus(call(idp, "PUT", `/scim/v2/Users/${MISSING}`, { body: { userName: "x@example.com" } }), 404);
+  await expectStatus(call(idp, "PUT", `/scim/v2/Users/${lee.id}`, { body: { userName: "pat@example.com" } }), 409);
+  await expectStatus(call(idp, "PUT", `/scim/v2/Users/${created.id}`, { body: {} }), 400);
+
+  assert.equal((await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${created.id}`, { body: { Operations: [{ op: "Replace", path: "active", value: "False" }] } }), 200)).body.active, false);
+  assert.equal((await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${created.id}`, { body: { Operations: [{ op: "replace", value: { active: true, displayName: "Pat" } }] } }), 200)).body.active, true);
+  await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${created.id}`, { body: { Operations: [] } }), 400);
+  await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${MISSING}`, { body: { Operations: [{ op: "replace", path: "active", value: false }] } }), 404);
+  await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${lee.id}`, { body: { Operations: [{ op: "replace", path: "userName", value: "pat@example.com" }] } }), 409);
+
+  // The only administrator cannot be removed this way; the refusal is documented (409), not a silent lockout.
+  const boss = (await expectStatus(call(idp, "POST", "/scim/v2/Users", { body: { userName: "dev-admin@example.com", roles: [{ value: "administrator" }] } }), 201)).body;
+  await api.db.query("UPDATE scim_users SET subject = 'dev-admin', bound_at = now() WHERE id = $1", [boss.id]);
+  await expectStatus(call(idp, "PATCH", `/scim/v2/Users/${boss.id}`, { body: { Operations: [{ op: "replace", path: "active", value: false }] } }), 409);
+  await expectStatus(call(idp, "DELETE", `/scim/v2/Users/${boss.id}`), 409);
+
+  const provisioned = (await expectStatus(call(admin, "GET", `${base}/users`), 200)).body;
+  assert.deepEqual(provisioned.map((row) => row.userName).sort(), ["dev-admin@example.com", "lee@example.com", "pat@example.com"]);
+  assert.deepEqual(provisioned.find((row) => row.userName === "lee@example.com").state, "deactivated");
+  await expectStatus(call(idp, "DELETE", `/scim/v2/Users/${lee.id}`), 204);
+  await expectStatus(call(idp, "DELETE", `/scim/v2/Users/${lee.id}`), 404);
+
+  await expectStatus(call(admin, "DELETE", `${base}/tokens/${issued.id}`), 204);
+  await expectStatus(call(idp, "GET", "/scim/v2/Users"), 401);
 });
 
 test("every documented operation was exercised against the live server", { skip }, () => {

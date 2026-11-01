@@ -1,0 +1,21 @@
+WirePulse Proprietary Software Licence
+
+Copyright (c) 2026 WirePulse. All rights reserved.
+
+This software, its source code, its documentation and its test material (together, "WirePulse") are the property of WirePulse. No licence,
+express or implied, is granted to you except under a written agreement signed by WirePulse (a pilot agreement, a subscription or a commercial
+licence). In particular, without such an agreement you may not:
+
+  - run WirePulse in production, or use it to provide a service to anyone else;
+  - copy, modify, merge, publish, distribute, sublicense or sell WirePulse, or any part of it;
+  - remove or alter this notice;
+  - reverse engineer WirePulse, except to the extent the law of your country allows it despite this restriction.
+
+Reading the source and documentation to assess whether to enter an agreement is permitted.
+
+Third-party components keep their own licences. The runtime dependencies of the API, the gateway agent and the console are listed in
+sbom/ (CycloneDX); they are not covered by this notice.
+
+WIREPULSE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NON-INFRINGEMENT, EXCEPT AS SET OUT IN A WRITTEN AGREEMENT WITH WIREPULSE. TO THE EXTENT THE LAW ALLOWS, WIREPULSE IS
+NOT LIABLE FOR ANY CLAIM OR DAMAGES ARISING FROM ITS USE.

@@ -146,11 +146,13 @@ WirePulse does not measure anything itself. It draws charts from numbers **your 
 For a number to be picked up, the device must print a line with a **name**, a `:` or `=`, and the **value**, for example:
 
 ```
-TEMP0: 24.5
-TEMP1=3.30
+CH0: 24.5
+CH1=3.30
 ```
 
-There are ten channels. They are named `TEMP0` to `TEMP9` to begin with.
+Several values can share one line when they are separated by a space, comma, semicolon or `|`, for example `CH0=1.5,CH1=2.5`. Signs and exponents are understood (`+3.30`, `1.2e-3`).
+
+There are ten channels. They are named `CH0` to `CH9` to begin with; these are only placeholders, so change each one to the name your device really prints (`VBAT`, `RPM`, `PRESSURE` and so on). **Reset to defaults** in the same panel brings the placeholders back.
 
 1. In **Telemetry dashboard**, click **Configure**.
 2. For each channel you want to use, set:
@@ -253,14 +255,22 @@ Your administrator sets the server up (see [DEPLOYMENT.md](DEPLOYMENT.md)). This
 
 ### 6.1 Connect
 
-You need two things from your administrator: the **address (URL) of the server**, and a way to get an **access token** (a long temporary password issued when you sign in through your company login).
+You need the **address (URL) of the server** from your administrator. Then either sign in through your company login, or paste an access token.
+
+**Sign in with SSO** (when your administrator has turned it on):
 
 1. In the left panel, find **Enterprise workspace**.
 2. Enter the **Control-plane URL**, for example `https://api.wirepulse.example.com`.
-3. Paste your **OIDC access token**.
-4. Click **Connect workspace**.
+3. Click **Sign in with SSO**. The browser goes to your company login page; sign in there as usual (including any second factor).
+4. You come back to WirePulse, signed in, and your workspaces appear. The session renews itself while the tab stays open. **Sign out** ends it in this tab (your company login may still hold its own session).
 
-When it works, you see "Connected" and a list of your workspaces appears. The token is kept in memory only; it is **not saved**, so you paste a fresh one each time you reload the page. Tokens expire quickly by design; if you see "invalid token" messages, get a new one.
+If the server has no browser sign-in set up, the console says so; use the token method below.
+
+**Paste a token** (a long temporary password that your company login issues):
+
+1. Enter the **Control-plane URL**, paste your **OIDC access token**, and click **Connect workspace**.
+
+When it works, you see "Connected" and a list of your workspaces appears. Tokens are kept in memory only and are **not saved**: after you reload the page, sign in again (or paste a fresh token). A pasted token is not renewed; tokens expire quickly by design, so if you see "invalid token" messages, get a new one.
 
 ### 6.2 Workspaces and what you can do
 
@@ -312,9 +322,13 @@ After you connect, the **Enterprise console** appears among the main panels. Its
 
 **Team** (maintainers and administrators): Lists members and their roles. Administrators can change a role from the drop-down, **Remove** a member, and **Invite** someone: enter their **Email**, choose a **Role** and click **Invite**. The server emails them if email is set up; otherwise tell them yourself. Pending invitations can be revoked.
 
-**API keys** (administrators): For automated systems such as CI that must start or read jobs without a person signing in. Give the key a **Name**, a **Role** (viewer, engineer or maintainer at most) and a **Lifetime** in days, then **Create key**. The key is shown **once**: put it straight into your CI secret store. Keys can be **Revoked** at any time, and the list shows when each was last used.
+**API keys** (administrators): For automated systems such as CI that must start or read jobs without a person signing in. Give the key a **Name**, a **Role** (viewer, engineer or maintainer at most) and a **Lifetime** in days, then **Create key**. The key is shown **once**: put it straight into your CI secret store. Keys can be **Revoked** at any time, and the list shows when each was last used. A key is tied to the person who created it: when that person is removed from the workspace (by you, or by your identity provider), the keys they created are revoked with them, so CI that must outlive its author should use a key created by a long-standing administrator.
 
 **Webhooks** (administrators): Make the server call your own system when a job finishes. Add a **Name** and the receiving **URL**. A one-time **secret** is shown; your receiver uses it to check each message's `X-WirePulse-Signature`. Use **Send test** to try it, **Deliveries** to see what was sent (and **Redeliver** if one failed), **Rotate secret**, **Disable/Enable**, **Edit** or **Delete**. If you see "Webhooks are not enabled on this server", the operator has not turned them on.
+
+**Provisioning** (administrators): Lets your company's identity provider (Okta, Microsoft Entra ID or any SCIM 2.0 system) add and remove people for you, so that someone who leaves is cut off automatically. Copy the **SCIM base URL** into the identity provider, click **Create token**, and paste the one-time token there as its bearer token. Under **Provisioned people** you see each person as *pending* (created by the identity provider, has not signed in yet), *active* or *deactivated*. Give people the role names exactly as written here (viewer, engineer, maintainer, administrator); with no role they get viewer. Your identity provider can also sync SCIM Groups. Groups are IdP-managed directory metadata, not access control: every member must already be a provisioned person in this workspace, and Group membership neither creates workspace access nor changes a role. Manage Groups in the identity provider; WirePulse has no separate Group-management tab. Watch the token list: a token that is about to **expire** is flagged, and an **expired** one means the identity provider is refused and leavers are no longer removed, so create a replacement and give it to the provider before then. Revoking a token locks the provider out at once. Deactivating or deleting someone removes them from the workspace and revokes the **API keys** they created (re-activating them restores their access, not those keys). The last administrator cannot be removed this way.
+
+**Audit** (administrators): The record of every change to the workspace (who, what, when, from where), newest first. **Filter** by exact action name (such as `gateway.revoked`) or by UTC date, and use **Load older events** to go further back. **Details** shows the request id, address and the fingerprints that chain each entry to the one before. **Verify chain** recomputes those fingerprints on the server and tells you whether any entry was altered or removed; it also shows the **head hash**, which you should copy to somewhere that nobody with database access can edit (a ticket, your SIEM). **Export (NDJSON)** saves the whole trail as a file for archiving.
 
 **Usage** (everyone): Your plan, and how much of each allowance you have used this month (members, gateways, API keys, webhooks, queued jobs, jobs and reports per month). Monthly counters reset on the 1st (UTC). If you hit a limit you see "the … plan limit for … is reached"; free something up or ask your provider for a bigger plan. Administrators also find **Delete this workspace** here. It stops all access immediately and requires typing the workspace name to confirm; your provider can restore it within the grace period.
 
@@ -330,6 +344,7 @@ For whoever is setting up a workspace first:
 4. **Anyone with a device:** write tests (section 5), click **Share tests**, then **Queue gateway job**.
 5. **Everyone:** follow progress in **Jobs**; download JUnit if CI needs it.
 6. **Administrator (optional):** create an **API key** for CI and a **webhook** to be told when jobs finish.
+7. **Administrator (optional):** connect your identity provider under **Provisioning** so leavers are removed automatically, and note the audit **head hash** from **Audit → Verify chain** somewhere safe.
 
 ---
 
@@ -364,7 +379,7 @@ For whoever is setting up a workspace first:
 
 | What you see | Likely cause and fix |
 |---|---|
-| "No telemetry channels yet" | The device has not printed a matching line yet. Check the token name and that the channel is ticked **On**. The name must start the line or follow a space. |
+| "No telemetry channels yet" | The device has not printed a matching line yet. Check the token name and that the channel is ticked **On**. The name must start the line or follow a space, comma, semicolon or `|` (so `XCH0=1` is not read as `CH0`). |
 
 ### Enterprise workspace
 
@@ -372,12 +387,15 @@ For whoever is setting up a workspace first:
 |---|---|
 | *Enter the HTTPS control-plane URL and your OIDC access token.* | One of the two boxes is empty. |
 | *Enterprise connection failed: network error* | The server could not be reached from this page. Check the URL and your network; if it still fails, ask your administrator, because the server must be set up to accept requests from the page you are using. |
-| *Enterprise connection failed: invalid_bearer_token* (or similar) | Your access token has expired or is wrong. Get a new one and paste it again. |
+| *Enterprise connection failed: invalid_bearer_token* (or similar) | Your access token has expired or is wrong. Sign in with SSO again, or get a new token and paste it. |
+| *This control plane has no browser sign-in configured* | The administrator has not set the sign-in client (`OIDC_CLIENT_ID`). Paste an access token instead. |
+| After **Sign in with SSO** the provider shows an error such as an invalid redirect address | The provider's client for WirePulse does not list this page's address as an allowed redirect. Tell your administrator the exact address shown in the browser. |
 | *insufficient_workspace_role* | Your role does not allow that action. Ask an administrator for a higher role. |
 | *Live updates refused for this credential — refreshing every 10 s* | Jobs still update, just a little slower. |
 | A job stays **queued** ("Waiting for a gateway to claim it") | No gateway is online. Open the **Gateways** tab; the lab computer's gateway must show **online**. |
 | Gateway shows **offline** | The gateway program on the lab computer is stopped or cannot reach the server, or its token was rotated or expired. Restart it with the current token. |
 | A gateway, key or webhook secret was lost | Rotate (gateway, webhook) or revoke and recreate (API key). They cannot be displayed again. |
+| Someone left the company but can still use the workspace | Check **Provisioning**: is there a usable token (not *expired* or *revoked*)? Is the person shown as *deactivated*? Their **API keys** are revoked with their access; a key made by someone still here keeps working, so check the API keys tab for keys you no longer need. |
 | *plan limit … is reached* | Your workspace plan is full for that item. Remove something or ask your provider for a larger plan. |
 
 ---

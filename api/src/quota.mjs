@@ -31,10 +31,13 @@ export async function usageOf(executor, workspaceId) {
   const counts = (await executor.query(
     `SELECT
        (SELECT count(*)::int FROM workspace_members WHERE workspace_id = $1) AS members,
-       (SELECT count(*)::int FROM workspace_invitations WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()) AS pending_invitations,
+       -- Someone the identity provider has provisioned but who has not signed in yet takes a seat exactly like an invitation does.
+       (SELECT count(*)::int FROM workspace_invitations WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now())
+         + (SELECT count(*)::int FROM scim_users WHERE workspace_id = $1 AND active AND subject IS NULL) AS pending_invitations,
        (SELECT count(*)::int FROM gateways WHERE workspace_id = $1 AND revoked_at IS NULL) AS gateways,
        (SELECT count(*)::int FROM api_keys WHERE workspace_id = $1 AND revoked_at IS NULL AND expires_at > now()) AS api_keys,
        (SELECT count(*)::int FROM webhooks WHERE workspace_id = $1) AS webhooks,
+       (SELECT count(*)::int FROM scim_tokens WHERE workspace_id = $1 AND revoked_at IS NULL AND expires_at > now()) AS scim_tokens,
        (SELECT count(*)::int FROM test_jobs WHERE workspace_id = $1 AND status = 'queued') AS queued_jobs,
        COALESCE((SELECT jobs_created FROM workspace_usage WHERE workspace_id = $1 AND period = ${PERIOD}), 0) AS jobs_this_month,
        COALESCE((SELECT reports_created FROM workspace_usage WHERE workspace_id = $1 AND period = ${PERIOD}), 0) AS reports_this_month,
@@ -42,7 +45,7 @@ export async function usageOf(executor, workspaceId) {
     [workspaceId]
   )).rows[0];
   return {
-    period: counts.period, members: counts.members, pendingInvitations: counts.pending_invitations, gateways: counts.gateways, apiKeys: counts.api_keys, webhooks: counts.webhooks,
+    period: counts.period, members: counts.members, pendingInvitations: counts.pending_invitations, gateways: counts.gateways, apiKeys: counts.api_keys, webhooks: counts.webhooks, scimTokens: counts.scim_tokens,
     queuedJobs: counts.queued_jobs, jobsThisMonth: counts.jobs_this_month, reportsThisMonth: counts.reports_this_month
   };
 }

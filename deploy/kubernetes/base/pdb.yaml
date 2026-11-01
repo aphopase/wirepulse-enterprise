@@ -1,0 +1,7 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wirepulse-api
+spec:
+  maxUnavailable: 1 # node drains and cluster upgrades take one replica at a time
+  selector: { matchLabels: { app.kubernetes.io/name: wirepulse-api } }

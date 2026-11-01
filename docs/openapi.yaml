@@ -13,6 +13,8 @@ info:
       always expire, and can never create keys, invitations or workspaces.
     * **Gateway agents** send a gateway token (`wpg_…`) to `/gateway/v1/*` only. Human credentials are not accepted there
       and gateway tokens are not accepted under `/v1`.
+    * **Identity providers** send a workspace SCIM token (`wps_…`) to `/scim/v2/*` only, to provision and deprovision the
+      workspace's people. It is created by a workspace administrator, always expires, and is accepted nowhere else.
 
     ## Roles
     `viewer` < `engineer` < `maintainer` < `administrator`, per workspace. Each operation states the minimum role in
@@ -50,6 +52,7 @@ tags:
   - name: Test reports
   - name: Members and invitations
   - name: API keys
+  - name: Provisioning (SCIM)
   - name: Audit
   - name: Gateway agent protocol
 security:
@@ -71,7 +74,7 @@ paths:
     get:
       tags: [Operations]
       summary: Readiness probe
-      description: Checks the database. Returns 503 while shutting down so load balancers drain the instance.
+      description: Checks the database, and that it accepts writes. Returns 503 while shutting down so load balancers drain the instance, and 503 when the database is reachable but read-only (a replica, or a primary that has been demoted or set read-only).
       security: []
       responses:
         "200":
@@ -84,14 +87,42 @@ paths:
                   status: { type: string, enum: [ready] }
                   checks: { type: object, properties: { database: { type: string, enum: [ok] } } }
         "503":
-          description: Shutting down or the database is unreachable
+          description: Shutting down, the database is unreachable, or the database is read-only
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { type: string, enum: [shutting_down, unavailable] }
-                  checks: { type: object, properties: { database: { type: string, enum: [failing] } } }
+                  checks: { type: object, properties: { database: { type: string, enum: [failing, read_only] } } }
+  /auth/config:
+    get:
+      tags: [Operations]
+      summary: Browser sign-in settings
+      description: |
+        Public. Tells the console how to start a browser sign-in with the authorization code flow and PKCE: the issuer, the public
+        client id, the scopes and, for providers that need it (Auth0), the audience to request. `sso` is `null` when the control
+        plane has no `OIDC_CLIENT_ID`; the console then offers only the pasted access token. Subject to the per-address rate limit.
+      security: []
+      responses:
+        "200":
+          description: Sign-in settings, or sso set to null
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sso]
+                properties:
+                  sso:
+                    nullable: true
+                    type: object
+                    required: [issuer, clientId, scopes, audience]
+                    properties:
+                      issuer: { type: string }
+                      clientId: { type: string }
+                      scopes: { type: string }
+                      audience: { type: string, nullable: true }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /metrics:
     get:
       tags: [Operations]
@@ -492,7 +523,8 @@ paths:
         Browsers cannot set an Authorization header on `EventSource`; read the stream with `fetch` instead.
         Authorization is checked when the stream opens, so a credential revoked later keeps its open stream until the server
         closes it: streams end after at most `SSE_MAX_LIFETIME_SECONDS` (default 1800) and on shutdown, and clients should
-        reconnect with backoff. Limits: `SSE_MAX_CLIENTS` per instance (`503 too_many_streams`) and 10 per subject
+        reconnect with backoff. Limits: `SSE_MAX_CLIENTS` per instance (`503 too_many_streams`),
+        `SSE_MAX_CLIENTS_PER_WORKSPACE` per instance for one workspace (`429 too_many_streams_for_workspace`) and 10 per subject
         (`429 too_many_streams_for_subject`); close the old stream before opening another.
       x-required-role: viewer
       responses:
@@ -958,7 +990,7 @@ paths:
     delete:
       tags: [Members and invitations]
       summary: Remove a member
-      description: The last administrator cannot be removed (`409 last_administrator`).
+      description: The last administrator cannot be removed (`409 last_administrator`). The API keys the member created are revoked with them (their ids are in the `member.removed` audit event).
       x-required-role: administrator
       responses:
         "204": { description: Removed }
@@ -1103,6 +1135,79 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/workspaces/{workspaceId}/scim/tokens:
+    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: List SCIM tokens
+      description: Only the 12-character prefix is shown. `lastUsedAt` tells whether the identity provider is still connected, and `expiresAt` when it will stop being able to deprovision.
+      x-required-role: administrator
+      responses:
+        "200":
+          description: Tokens, newest first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ScimToken" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Create a SCIM token for an identity provider
+      description: |
+        The token is returned once and only its hash is stored. It is scoped to this workspace and always expires
+        (default 365 days, capped by the server's `SCIM_TOKEN_MAX_DAYS`). The number of active tokens is limited by the plan
+        (`scimTokens`; the free and team plans have none). Human identities only.
+      x-required-role: administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScimTokenInput" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ScimTokenWithToken" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/workspaces/{workspaceId}/scim/tokens/{id}:
+    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }, { $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [Provisioning (SCIM)]
+      summary: Revoke a SCIM token
+      description: The identity provider using it can no longer provision or deprovision until it is given a new token.
+      x-required-role: administrator
+      responses:
+        "204": { description: Revoked }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/workspaces/{workspaceId}/scim/users:
+    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: List the people an identity provider has provisioned
+      description: |
+        `state` is `pending` (provisioned, has not signed in yet; takes a seat), `active` (has access) or `deactivated`
+        (the identity provider withdrew access).
+      x-required-role: administrator
+      responses:
+        "200":
+          description: Provisioned people, newest first (at most 500)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ProvisionedUser" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
   /v1/workspaces/{workspaceId}/audit-events:
@@ -1267,6 +1372,366 @@ paths:
         "422": { $ref: "#/components/responses/EvidenceRejected" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
+  /scim/v2/ServiceProviderConfig:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: SCIM service provider configuration
+      description: |
+        Users and Groups are supported. PATCH and filtering are supported; Users and Groups each have their own `/.search` endpoint; Bulk, sorting, ETags and password changes are not.
+        The discovery endpoints are read-only: any other method answers `405` with `Allow: GET`.
+      security: [{ scimAuth: [] }]
+      responses:
+        "200":
+          description: The configuration
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimDocument" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/ResourceTypes:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: SCIM resource types (User and Group)
+      security: [{ scimAuth: [] }]
+      responses:
+        "200":
+          description: The resource types
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimDocument" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/ResourceTypes/{document}:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: One SCIM resource type, by name
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { name: document, in: path, required: true, schema: { type: string, maxLength: 200 }, example: "User" }
+      responses:
+        "200":
+          description: The document
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimDocument" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Schemas:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: SCIM schemas (User and Group)
+      security: [{ scimAuth: [] }]
+      responses:
+        "200":
+          description: The schemas
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimDocument" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Schemas/{document}:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: One SCIM schema, by its URN
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { name: document, in: path, required: true, schema: { type: string, maxLength: 200 }, example: "urn:ietf:params:scim:schemas:core:2.0:User" }
+      responses:
+        "200":
+          description: The document
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimDocument" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Users:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: List or look up users
+      description: |
+        `filter` supports exactly `userName`, `externalId`, `id` or `emails.value` with `eq "value"` (what Okta and Entra ID
+        send before creating a user). `startIndex` is 1-based; `count` is at most 200.
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { name: filter, in: query, schema: { type: string, maxLength: 500 }, example: 'userName eq "pat@example.com"' }
+        - { name: startIndex, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: count, in: query, schema: { type: integer, minimum: 0, maximum: 200, default: 100 } }
+        - { $ref: "#/components/parameters/ScimAttributes" }
+        - { $ref: "#/components/parameters/ScimExcludedAttributes" }
+      responses:
+        "200":
+          description: A page of users
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUserList" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Provision a user
+      description: |
+        The person gets access the first time they sign in with a verified OIDC email equal to the address given here
+        (`emails` or an email-format `userName`); until then they take a seat like a pending invitation. A member who
+        already has that address is adopted and keeps their role unless `roles` is sent. `roles` is one of `viewer`
+        (default), `engineer`, `maintainer`, `administrator`. `active: false` provisions someone without access.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimUserInput" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimUserInput" } }
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location: { schema: { type: string }, description: URL of the new user }
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUser" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "403": { $ref: "#/components/responses/ScimForbidden" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Users/.search:
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Search users (POST)
+      description: |
+        RFC 7644 section 3.4.3: the parameters of the list operation in a body instead of the query string, for filters too
+        long or sensitive for a URL. WirePulse has one resource type, so both paths search the users.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+      responses:
+        "200":
+          description: A page of users
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUserList" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/.search:
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Search all resources (POST)
+      description: |
+        RFC 7644 section 3.4.3: the parameters of the list operation in a body instead of the query string, for filters too
+        long or sensitive for a URL. WirePulse has one resource type, so both paths search the users.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+      responses:
+        "200":
+          description: A page of users
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUserList" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Groups:
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: List or look up groups
+      description: '`filter` supports exactly `displayName`, `externalId` or `id` with `eq "value"`. Group membership is directory metadata only and never grants workspace access or changes a role.'
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { name: filter, in: query, schema: { type: string, maxLength: 500 }, example: 'displayName eq "Hardware"' }
+        - { name: startIndex, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: count, in: query, schema: { type: integer, minimum: 0, maximum: 200, default: 100 } }
+        - { $ref: "#/components/parameters/ScimAttributes" }
+        - { $ref: "#/components/parameters/ScimExcludedAttributes" }
+      responses:
+        "200":
+          description: A page of groups
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroupList" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Provision a directory group
+      description: "Every member must already be a provisioned User in this workspace. Membership is directory metadata only: it neither grants workspace access nor changes roles."
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroupInput" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimGroupInput" } }
+      responses:
+        "201":
+          description: Created
+          headers:
+            Location: { schema: { type: string }, description: URL of the new group }
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroup" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Groups/.search:
+    post:
+      tags: [Provisioning (SCIM)]
+      summary: Search groups (POST)
+      description: "RFC 7644 section 3.4.3: list parameters in a body instead of the query string."
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimSearchRequest" } }
+      responses:
+        "200":
+          description: A page of groups
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroupList" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Groups/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: Read a group
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/ScimAttributes" }
+        - { $ref: "#/components/parameters/ScimExcludedAttributes" }
+      responses:
+        "200":
+          description: The group
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroup" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    put:
+      tags: [Provisioning (SCIM)]
+      summary: Replace a group
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroupInput" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimGroupInput" } }
+      responses:
+        "200":
+          description: The updated group
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroup" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Provisioning (SCIM)]
+      summary: Update a group
+      description: Replacing `members` sets the full membership. Adding or removing `members` changes only the named provisioned users.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimPatch" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimPatch" } }
+      responses:
+        "200":
+          description: The updated group
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimGroup" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Provisioning (SCIM)]
+      summary: Delete a group
+      security: [{ scimAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /scim/v2/Users/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    get:
+      tags: [Provisioning (SCIM)]
+      summary: Read a user
+      security: [{ scimAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/ScimAttributes" }
+        - { $ref: "#/components/parameters/ScimExcludedAttributes" }
+      responses:
+        "200":
+          description: The user
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUser" } }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    put:
+      tags: [Provisioning (SCIM)]
+      summary: Replace a user
+      description: Attributes not sent are cleared, except `active` and `roles`, which stay as they are when omitted.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimUserInput" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimUserInput" } }
+      responses:
+        "200":
+          description: The updated user
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUser" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "403": { $ref: "#/components/responses/ScimForbidden" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Provisioning (SCIM)]
+      summary: Update a user
+      description: |
+        Both Okta (no `path`, attributes in one object) and Microsoft Entra ID (`Replace`, `"False"`) styles are accepted.
+        Setting `active` to false removes the person's workspace access at once, ends their open live streams, revokes the API
+        keys they created (the ids are in the audit event's `apiKeysRevoked`), and fails with `409 last_administrator` if they are
+        the workspace's only administrator. Setting it to true restores access, not those keys.
+        Attributes WirePulse does not store are ignored.
+      security: [{ scimAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/scim+json: { schema: { $ref: "#/components/schemas/ScimPatch" } }
+          application/json: { schema: { $ref: "#/components/schemas/ScimPatch" } }
+      responses:
+        "200":
+          description: The updated user
+          content:
+            application/scim+json: { schema: { $ref: "#/components/schemas/ScimUser" } }
+        "400": { $ref: "#/components/responses/ScimBadRequest" }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "403": { $ref: "#/components/responses/ScimForbidden" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Provisioning (SCIM)]
+      summary: Delete a user
+      description: Removes the record and the person's workspace access (and any member with the same address) and revokes the API keys they created, as deactivation does. `409 last_administrator` if they are the only administrator.
+      security: [{ scimAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/ScimUnauthorized" }
+        "404": { $ref: "#/components/responses/ScimNotFound" }
+        "409": { $ref: "#/components/responses/ScimConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1277,6 +1742,10 @@ components:
       type: http
       scheme: bearer
       description: Gateway token `wpg_…`, accepted only under `/gateway/v1`
+    scimAuth:
+      type: http
+      scheme: bearer
+      description: Workspace SCIM token `wps_…`, accepted only under `/scim/v2`
     metricsAuth:
       type: http
       scheme: bearer
@@ -1289,6 +1758,18 @@ components:
     WorkspaceId: { name: workspaceId, in: path, required: true, schema: { type: string, format: uuid } }
     Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
     DeliveryId: { name: deliveryId, in: path, required: true, schema: { type: string, format: uuid } }
+    ScimAttributes:
+      name: attributes
+      in: query
+      description: Comma-separated attribute names to return (RFC 7644 section 3.4.2.5). `id` and `schemas` are always returned; nested names such as `name.givenName` are accepted.
+      schema: { type: string, maxLength: 500 }
+      example: userName,active
+    ScimExcludedAttributes:
+      name: excludedAttributes
+      in: query
+      description: Comma-separated attribute names to leave out. Ignored when `attributes` is given.
+      schema: { type: string, maxLength: 500 }
+      example: roles
     Version: { name: version, in: path, required: true, schema: { type: integer, minimum: 1 } }
     IfMatchVersion:
       name: If-Match-Version
@@ -1320,6 +1801,21 @@ components:
     Conflict:
       description: State conflict (`version_conflict_or_not_found`, `idempotency_key_reused`, `last_administrator`, `already_member`, …)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    ScimUnauthorized:
+      description: Missing, wrong-type, expired or revoked SCIM token
+      content: { application/scim+json: { schema: { $ref: "#/components/schemas/ScimError" } } }
+    ScimBadRequest:
+      description: Invalid SCIM request (`invalidSyntax`, `invalidValue`, `invalidFilter`, `mutability`, `noTarget`)
+      content: { application/scim+json: { schema: { $ref: "#/components/schemas/ScimError" } } }
+    ScimForbidden:
+      description: The plan's member limit is used up (`plan_limit_reached`)
+      content: { application/scim+json: { schema: { $ref: "#/components/schemas/ScimError" } } }
+    ScimNotFound:
+      description: No such SCIM resource in this workspace
+      content: { application/scim+json: { schema: { $ref: "#/components/schemas/ScimError" } } }
+    ScimConflict:
+      description: "`uniqueness` (a User or Group identifier already provisioned) or `last_administrator`"
+      content: { application/scim+json: { schema: { $ref: "#/components/schemas/ScimError" } } }
     WebhooksNotConfigured:
       description: The deployment has no `WEBHOOK_SIGNING_KEY`, so webhooks are not available (`webhooks_not_configured`). Only callers allowed to use the feature see this
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -1367,6 +1863,224 @@ components:
         error: { type: string, description: Stable machine-readable code }
         requestId: { type: string }
         details: { type: object, additionalProperties: true }
+    ScimToken:
+      type: object
+      required: [id, name, prefix, createdAt, expiresAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, description: "First 12 characters of the token, for identification" }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+        revokedAt: { type: string, format: date-time, nullable: true }
+    ScimTokenInput:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: { $ref: "#/components/schemas/Name" }
+        expiresInDays: { type: integer, minimum: 1, description: "Default 365; at most the server's SCIM_TOKEN_MAX_DAYS" }
+    ScimTokenWithToken:
+      allOf:
+        - { $ref: "#/components/schemas/ScimToken" }
+        - type: object
+          required: [token]
+          properties:
+            token: { type: string, description: "The bearer token for the identity provider; shown once" }
+    ProvisionedUser:
+      type: object
+      required: [id, userName, email, role, state, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        userName: { type: string }
+        email: { type: string }
+        displayName: { type: string, nullable: true }
+        externalId: { type: string, nullable: true }
+        role: { $ref: "#/components/schemas/Role" }
+        state: { type: string, enum: [pending, active, deactivated] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        boundAt: { type: string, format: date-time, nullable: true, description: "When the person first signed in and got access" }
+        deactivatedAt: { type: string, format: date-time, nullable: true }
+    ScimDocument:
+      type: object
+      description: A SCIM discovery document (RFC 7643/7644); see the standard for its fields
+      required: [schemas]
+      properties:
+        schemas: { type: array, items: { type: string } }
+      additionalProperties: true
+    ScimUser:
+      type: object
+      required: [schemas, id, userName, emails, active, roles, meta]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        id: { type: string, format: uuid }
+        externalId: { type: string }
+        userName: { type: string }
+        displayName: { type: string }
+        name:
+          type: object
+          properties:
+            givenName: { type: string }
+            familyName: { type: string }
+        emails:
+          type: array
+          items:
+            type: object
+            required: [value, primary]
+            properties:
+              value: { type: string }
+              type: { type: string }
+              primary: { type: boolean }
+        active: { type: boolean }
+        roles:
+          type: array
+          items:
+            type: object
+            required: [value, primary]
+            properties:
+              value: { $ref: "#/components/schemas/Role" }
+              primary: { type: boolean }
+        meta:
+          type: object
+          required: [resourceType, created, lastModified, location]
+          properties:
+            resourceType: { type: string }
+            created: { type: string, format: date-time }
+            lastModified: { type: string, format: date-time }
+            location: { type: string }
+    ScimUserInput:
+      type: object
+      required: [userName]
+      additionalProperties: true
+      properties:
+        schemas: { type: array, items: { type: string } }
+        userName: { type: string, minLength: 1, maxLength: 254 }
+        externalId: { type: string, maxLength: 256, nullable: true }
+        displayName: { type: string, maxLength: 256, nullable: true }
+        name:
+          type: object
+          nullable: true
+          properties:
+            givenName: { type: string, maxLength: 128, nullable: true }
+            familyName: { type: string, maxLength: 128, nullable: true }
+        emails:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: { type: string }
+              type: { type: string }
+              primary: { type: boolean }
+        active:
+          description: A boolean, or the strings "True"/"False" that Entra ID sends
+          oneOf:
+            - { type: boolean }
+            - { type: string, enum: ["True", "False", "true", "false"] }
+        roles:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: { type: string, description: "viewer, engineer, maintainer or administrator (any case)" }
+              primary: { type: boolean }
+    ScimGroup:
+      type: object
+      required: [schemas, id, displayName, meta]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        id: { type: string, format: uuid }
+        externalId: { type: string }
+        displayName: { type: string }
+        members:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: { type: string, format: uuid }
+              display: { type: string }
+        meta:
+          type: object
+          required: [resourceType, created, lastModified, location]
+          properties:
+            resourceType: { type: string }
+            created: { type: string, format: date-time }
+            lastModified: { type: string, format: date-time }
+            location: { type: string }
+    ScimGroupInput:
+      type: object
+      required: [displayName]
+      additionalProperties: true
+      properties:
+        schemas: { type: array, items: { type: string } }
+        displayName: { type: string, minLength: 1, maxLength: 256 }
+        externalId: { type: string, maxLength: 256, nullable: true }
+        members:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: { type: string, format: uuid }
+    ScimGroupList:
+      type: object
+      required: [schemas, totalResults, startIndex, itemsPerPage, Resources]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        totalResults: { type: integer }
+        startIndex: { type: integer }
+        itemsPerPage: { type: integer }
+        Resources: { type: array, items: { $ref: "#/components/schemas/ScimGroup" } }
+    ScimPatch:
+      type: object
+      required: [Operations]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        Operations:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [op]
+            properties:
+              op: { type: string, description: "add, replace or remove (any case)" }
+              path: { type: string, example: active }
+              value: {}
+    ScimSearchRequest:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items: { type: string, example: "urn:ietf:params:scim:api:messages:2.0:SearchRequest" }
+        filter: { type: string, maxLength: 500 }
+        startIndex: { type: integer, description: Values below 1 are treated as 1 }
+        count: { type: integer, description: Clamped to 0..200; 0 returns only totalResults }
+        attributes: { type: array, maxItems: 50, items: { type: string, maxLength: 100 } }
+        excludedAttributes: { type: array, maxItems: 50, items: { type: string, maxLength: 100 } }
+    ScimUserList:
+      type: object
+      required: [schemas, totalResults, startIndex, itemsPerPage, Resources]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        totalResults: { type: integer }
+        startIndex: { type: integer }
+        itemsPerPage: { type: integer }
+        Resources: { type: array, items: { $ref: "#/components/schemas/ScimUser" } }
+    ScimError:
+      type: object
+      required: [schemas, status, detail]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        status: { type: string }
+        scimType: { type: string, enum: [invalidFilter, invalidSyntax, invalidValue, mutability, noTarget, uniqueness] }
+        detail: { type: string }
     Name: { type: string, minLength: 1, maxLength: 120 }
     Role: { type: string, enum: [viewer, engineer, maintainer, administrator] }
     Labels:
@@ -1390,26 +2104,28 @@ components:
     PlanLimits:
       type: object
       description: Limits of the plan; `null` means unlimited
-      required: [members, gateways, apiKeys, webhooks, queuedJobs, jobsPerMonth, reportsPerMonth, requestsPerMinute]
+      required: [members, gateways, apiKeys, webhooks, scimTokens, queuedJobs, jobsPerMonth, reportsPerMonth, requestsPerMinute]
       properties:
         members: { type: integer, nullable: true }
         gateways: { type: integer, nullable: true }
         apiKeys: { type: integer, nullable: true }
         webhooks: { type: integer, nullable: true }
+        scimTokens: { type: integer, nullable: true }
         queuedJobs: { type: integer, nullable: true }
         jobsPerMonth: { type: integer, nullable: true }
         reportsPerMonth: { type: integer, nullable: true }
         requestsPerMinute: { type: integer, nullable: true }
     WorkspaceUsage:
       type: object
-      required: [period, members, pendingInvitations, gateways, apiKeys, webhooks, queuedJobs, jobsThisMonth, reportsThisMonth]
+      required: [period, members, pendingInvitations, gateways, apiKeys, webhooks, scimTokens, queuedJobs, jobsThisMonth, reportsThisMonth]
       properties:
         period: { type: string, format: date, description: First day of the metering month (UTC) }
         members: { type: integer }
-        pendingInvitations: { type: integer }
+        pendingInvitations: { type: integer, description: Invitations not yet accepted plus provisioned people who have not signed in yet }
         gateways: { type: integer, description: "Active (not revoked) gateways" }
         apiKeys: { type: integer, description: "Active (not revoked, not expired) API keys" }
         webhooks: { type: integer }
+        scimTokens: { type: integer, description: "Active (not revoked, not expired) SCIM tokens" }
         queuedJobs: { type: integer }
         jobsThisMonth: { type: integer }
         reportsThisMonth: { type: integer }

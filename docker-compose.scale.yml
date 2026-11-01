@@ -26,6 +26,10 @@ services:
     deploy: { resources: { limits: { cpus: "0.5", memory: 192M } } }
     restart: unless-stopped
 
+  # Behind several replicas the database is the shared bottleneck. These limits are ceilings, not reservations; measure and size them for your host and workload.
+  postgres:
+    deploy: { resources: { limits: { cpus: "${POSTGRES_CPUS:-6.0}", memory: "${POSTGRES_MEMORY:-4G}" } } }
+
   api:
     environment:
       REDIS_URL: redis://redis:6379
@@ -49,6 +53,24 @@ services:
     tmpfs: [/tmp, /var/cache/nginx, /var/run]
     cap_drop: [ALL]
     cap_add: [CHOWN, SETGID, SETUID]
+    security_opt: ["no-new-privileges:true"]
+    deploy: { resources: { limits: { cpus: "1.0", memory: 128M } } }
+    restart: unless-stopped
+
+  # The same job as `lb`, with active health checks: it drops a replica that fails /readyz (frozen, draining, cut off from PostgreSQL) and
+  # takes it back when it recovers. Not started by default; add `--profile haproxy` (and use HAPROXY_PORT instead of LB_PORT).
+  # After editing deploy/haproxy.scale.cfg run `docker compose ... --profile haproxy up -d --force-recreate lb-haproxy`.
+  lb-haproxy:
+    profiles: [haproxy]
+    image: haproxy:lts-alpine
+    volumes:
+      - ./deploy/haproxy.scale.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:${HAPROXY_PORT:-8081}:8080"
+    networks: [default]
+    depends_on: [api]
+    read_only: true
+    cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     deploy: { resources: { limits: { cpus: "1.0", memory: 128M } } }
     restart: unless-stopped

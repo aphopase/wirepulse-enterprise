@@ -1,0 +1,21 @@
+# Non-secret settings. DEPLOYMENT.md lists every option. The database URL is the one required secret: create it yourself (or with
+# your secret manager) as Secret "wirepulse-secrets", key "database_url":
+#   kubectl -n wirepulse create secret generic wirepulse-secrets --from-file=database_url=./database_url
+# SMTP_URL, WEBHOOK_SIGNING_KEY and METRICS_TOKEN also accept a *_FILE form; add them to the same Secret and the Deployment's env if used.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wirepulse-config
+data:
+  NODE_ENV: production            # startup fails fast unless OIDC and https CORS origins below are real
+  PORT: "8080"
+  MIGRATE_ON_START: "false"       # the migrate Job owns the schema; replicas never race to migrate
+  TRUST_PROXY: "1"                # number of proxies in front of the API (your ingress controller)
+  CORS_ORIGINS: "https://wirepulse.example.com"
+  OIDC_ISSUER: "https://idp.example.com/"
+  OIDC_AUDIENCE: "wirepulse"
+  # OIDC_CLIENT_ID: "wirepulse-console"   # optional: public client for the console's "Sign in with SSO" (authorization code + PKCE)
+  LOG_LEVEL: info
+  DB_POOL_SIZE: "10"
+  # DB_ROW_LEVEL_SECURITY: "true"          # default; "false" only if the migrating user cannot create roles (DEPLOYMENT.md)
+  # REDIS_URL: "redis://redis.example:6379"   # optional: shares rate-limit counters across replicas

@@ -2,6 +2,9 @@ import { JOB_COLUMNS, publicJob } from "./http.mjs";
 
 const PER_SUBJECT_LIMIT = 10;
 
+// Called inside the transaction that withdraws someone's access; PostgreSQL delivers it to every instance when that commits.
+export const announceRevoked = (executor, workspaceId, subject) => executor.query("SELECT pg_notify('wirepulse_access', $1)", [JSON.stringify({ w: workspaceId, s: subject })]);
+
 // Fans PostgreSQL NOTIFY events out to Server-Sent Events clients. One dedicated LISTEN connection per API instance.
 export function createJobStream({ db, config, log, metrics }) {
   const clients = new Map(); // res -> { workspaceId, subject }
@@ -25,6 +28,11 @@ export function createJobStream({ db, config, log, metrics }) {
     } catch (error) { log.error({ err: error }, "job stream flush failed"); }
   }
 
+  // Someone's access to a workspace was withdrawn: their open streams there end now instead of at the end of their lifetime.
+  function closeFor(workspaceId, subject) {
+    for (const [res, meta] of clients) if (meta.workspaceId === workspaceId && meta.subject === subject) { send(res, "revoked", {}); res.end(); }
+  }
+
   function connect() {
     if (stopped) return;
     const client = db.newListenerClient();
@@ -32,7 +40,8 @@ export function createJobStream({ db, config, log, metrics }) {
     const lost = (error) => {
       if (listener !== client) return;
       listener = null; metrics.listenerUp.set(0);
-      client.removeAllListeners(); client.end().catch(() => {});
+      // PgBouncer sends a second error right after the first when the server behind it dies; with no listener left that would crash the process.
+      client.removeAllListeners(); client.on("error", () => {}); client.end().catch(() => {});
       if (error) log.error({ err: error }, "job stream listener lost");
       broadcast(null, "resync", {});
       if (!stopped) { attempt += 1; reconnectTimer = setTimeout(connect, Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)) * (0.5 + Math.random() / 2)); reconnectTimer.unref(); }
@@ -42,13 +51,14 @@ export function createJobStream({ db, config, log, metrics }) {
     client.on("notification", (message) => {
       metrics.sseNotifications.inc();
       try {
+        if (message.channel === "wirepulse_access") { const { w, s } = JSON.parse(message.payload); closeFor(w, s); return; }
         const { w, id } = JSON.parse(message.payload);
         // Skip work when nobody in that workspace is watching.
         let watched = false; for (const meta of clients.values()) if (meta.workspaceId === w) { watched = true; break; }
         if (watched) { pending.add(id); flushTimer ??= setTimeout(flush, 100); }
       } catch { /* malformed payloads are ignored */ }
     });
-    client.connect().then(() => client.query("LISTEN wirepulse_jobs")).then(() => { attempt = 0; metrics.listenerUp.set(1); log.info("job stream listener connected"); }).catch(lost);
+    client.connect().then(() => client.query("LISTEN wirepulse_jobs")).then(() => client.query("LISTEN wirepulse_access")).then(() => { attempt = 0; metrics.listenerUp.set(1); log.info("job stream listener connected"); }).catch(lost);
   }
 
   return {
@@ -57,7 +67,10 @@ export function createJobStream({ db, config, log, metrics }) {
       try {
         const subject = req.identity.subject;
         if (clients.size >= config.sse.maxClients) return res.status(503).json({ error: "too_many_streams" });
-        let mine = 0; for (const meta of clients.values()) if (meta.subject === subject) mine += 1;
+        // One workspace cannot fill the instance: its streams are capped, so the other workspaces' people can still open theirs.
+        let mine = 0; let inWorkspace = 0;
+        for (const meta of clients.values()) { if (meta.subject === subject) mine += 1; if (meta.workspaceId === req.workspaceId) inWorkspace += 1; }
+        if (inWorkspace >= config.sse.maxClientsPerWorkspace) return res.status(429).json({ error: "too_many_streams_for_workspace" });
         if (mine >= PER_SUBJECT_LIMIT) return res.status(429).json({ error: "too_many_streams_for_subject" });
         res.set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
         res.flushHeaders();

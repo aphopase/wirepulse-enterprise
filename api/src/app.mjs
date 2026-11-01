@@ -17,6 +17,7 @@ import { startOutbox } from "./outbox.mjs";
 import { startPurge } from "./purge.mjs";
 import { createRateLimiters } from "./ratelimit.mjs";
 import { startRetention } from "./retention.mjs";
+import { registerScimRoutes } from "./scim.mjs";
 import { createJobStream } from "./stream.mjs";
 import { createDeliverer } from "./deliver.mjs";
 import { registerWebhookRoutes } from "./webhooks.mjs";
@@ -26,14 +27,20 @@ const REQUEST_ID = /^[A-Za-z0-9._-]{8,64}$/;
 const EVIDENCE_ROUTES = [["POST", /^\/workspaces\/[^/]+\/test-reports$/], ["POST", /^\/jobs\/[^/]+\/complete$/]];
 
 export function createApp({ config, db, log }) {
-  const metrics = createMetrics({ db });
+  // Request handlers use db (confined to the caller's workspace when row-level security is on); the background workers and anything
+  // else that is across workspaces by nature use the unrestricted role.
+  const system = db.system ?? db;
+  const metrics = createMetrics({ db: system });
   const limiters = createRateLimiters({ config, metrics, log });
-  const auth = createAuth({ config, db, log, metrics, workspaceLimiter: limiters.workspace, onAuthFailure: limiters.authFailure.record });
-  const stream = createJobStream({ db, config, log, metrics });
+  const auth = createAuth({ config, db, log, metrics, workspaceLimiter: limiters.workspace, onAuthFailure: limiters.authFailure.record, onAuthSuccess: limiters.authFailure.succeed });
+  const stream = createJobStream({ db: system, config, log, metrics });
   const state = { shuttingDown: false };
   const app = express();
 
   app.disable("x-powered-by");
+  // While draining, every response asks the client to close its connection. Clients then move to another replica on their next request instead of
+  // having an idle keep-alive connection cut at the moment they reuse it (what a rolling update did to roughly one request in 10,000).
+  app.use((_req, res, next) => { if (state.shuttingDown) res.setHeader("Connection", "close"); next(); });
   app.set("etag", false);
   app.set("trust proxy", config.trustProxy);
   validateUuidParams(app, ["workspaceId", "id", "deliveryId"]);
@@ -61,7 +68,9 @@ export function createApp({ config, db, log }) {
   app.get("/readyz", h(async (_req, res) => {
     if (state.shuttingDown) return res.status(503).json({ status: "shutting_down" });
     try {
-      await Promise.race([db.health(), new Promise((_resolve, reject) => { setTimeout(() => reject(new Error("health check timed out")), 2000).unref(); })]);
+      const { readOnly } = await Promise.race([db.health(), new Promise((_resolve, reject) => { setTimeout(() => reject(new Error("health check timed out")), 2000).unref(); })]);
+      // A reachable but read-only database (a replica after a failover, a demoted primary) is not ready: reads would work and every write fail.
+      if (readOnly) return res.status(503).json({ status: "unavailable", checks: { database: "read_only" } });
       return res.json({ status: "ready", checks: { database: "ok" } });
     } catch { return res.status(503).json({ status: "unavailable", checks: { database: "failing" } }); }
   }));
@@ -89,16 +98,20 @@ export function createApp({ config, db, log }) {
   // Where webhooks may be sent (see netguard.mjs) and how invitation email leaves; both are only built when configured.
   const guard = createGuard({ allowedCidrs: config.webhooks?.allowedCidrs ?? [], allowAll: config.webhooks?.allowPrivateNetworks ?? false });
   const mailer = config.smtp ? createMailer(config.smtp) : null;
-  const ctx = { db, config, log, metrics, auth, apiAudit, stream, guard };
+  const ctx = { db, system, config, log, metrics, auth, apiAudit, stream, guard, limiters };
 
   app.use(limiters.ip);
-  app.use("/gateway/v1", limiters.authFailure, auth.gatewayAuth, limiters.gateway, parseBody);
+  // What the console needs to start a browser sign-in (authorization code with PKCE). Public on purpose: the issuer and client id are in every authorization URL.
+  const browser = config.oidc?.browser;
+  app.get("/auth/config", (_req, res) => res.json({ sso: browser ? { issuer: config.oidc.issuer, clientId: browser.clientId, scopes: browser.scopes, audience: browser.sendAudience ? config.oidc.audience : null } : null }));
+  app.use("/gateway/v1", limiters.authFailure, auth.gatewayAuth, limiters.gateway, parseBody, auth.scope);
   registerGatewayRoutes(app, ctx);
   app.use("/v1", limiters.authFailure, auth.identity, limiters.subject, parseBody);
   registerAdminRoutes(app, ctx);
   registerJobRoutes(app, ctx);
   registerGatewayAdminRoutes(app, ctx);
   registerWebhookRoutes(app, ctx);
+  registerScimRoutes(app, ctx);
 
   app.use((req, res) => res.status(404).json({ error: "not_found", requestId: req.requestId }));
   app.use(errorHandler({ log, metrics }));
@@ -125,17 +138,19 @@ export function createApp({ config, db, log }) {
         await listen(metricsServer, config.metrics.port);
       }
       stream.start();
-      sweeper = startLeaseSweeper({ db, config, log, metrics });
-      retention = startRetention({ db, config, log, metrics });
-      anchoring = startAnchoring({ db, config, log, metrics });
-      purge = startPurge({ db, config, log, metrics });
-      if (config.webhooks || config.smtp) outbox = startOutbox({ db, config, log, metrics, deliver: createDeliverer({ db, config, mailer, guard }) });
+      sweeper = startLeaseSweeper({ db: system, config, log, metrics });
+      retention = startRetention({ db: system, config, log, metrics });
+      anchoring = startAnchoring({ db: system, config, log, metrics });
+      purge = startPurge({ db: system, config, log, metrics });
+      if (config.webhooks || config.smtp) outbox = startOutbox({ db: system, config, log, metrics, deliver: createDeliverer({ db: system, config, mailer, guard }) });
       return { port };
     },
-    // Stops accepting work, lets in-flight requests finish, closes streams and the pool.
-    async shutdown({ graceMs = 10_000 } = {}) {
+    // Stops accepting work, lets in-flight requests finish, closes streams and the pool. drainMs: keep serving (readiness already answers 503 and
+    // responses carry Connection: close) for that long before the listener closes, so keep-alive clients leave on their own.
+    async shutdown({ graceMs = 10_000, drainMs = 0 } = {}) {
       if (state.shuttingDown) return;
       state.shuttingDown = true;
+      if (drainMs > 0) await new Promise((resolve) => { setTimeout(resolve, drainMs); });
       sweeper?.stop(); retention?.stop(); anchoring?.stop();
       const outboxStopped = outbox?.stop(); const purgeStopped = purge?.stop();
       await stream.stop();

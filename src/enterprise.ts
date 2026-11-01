@@ -8,9 +8,15 @@ export type EnterpriseGateway = { id: string; name: string; online: boolean; lab
 export type EnterpriseMember = { subject: string; email: string | null; role: Role; createdAt: string };
 export type EnterpriseInvitation = { id: string; email: string; role: Role; invitedBy?: string; createdAt: string; expiresAt: string; acceptedBy: string | null; acceptedAt: string | null; revokedAt: string | null };
 export type EnterpriseApiKey = { id: string; name: string; role: "viewer" | "engineer" | "maintainer"; prefix: string; createdBy?: string; createdAt: string; expiresAt: string; lastUsedAt: string | null; revokedAt: string | null };
-export type PlanLimits = { members: number | null; gateways: number | null; apiKeys: number | null; webhooks: number | null; queuedJobs: number | null; jobsPerMonth: number | null; reportsPerMonth: number | null; requestsPerMinute: number | null };
-export type WorkspaceUsage = { period: string; members: number; pendingInvitations: number; gateways: number; apiKeys: number; webhooks: number; queuedJobs: number; jobsThisMonth: number; reportsThisMonth: number };
+export type PlanLimits = { members: number | null; gateways: number | null; apiKeys: number | null; scimTokens: number | null; webhooks: number | null; queuedJobs: number | null; jobsPerMonth: number | null; reportsPerMonth: number | null; requestsPerMinute: number | null };
+export type WorkspaceUsage = { period: string; members: number; pendingInvitations: number; gateways: number; apiKeys: number; scimTokens: number; webhooks: number; queuedJobs: number; jobsThisMonth: number; reportsThisMonth: number };
 export type EnterprisePlan = { plan: string; limits: PlanLimits; usage: WorkspaceUsage };
+export type EnterpriseScimToken = { id: string; name: string; prefix: string; createdBy: string; createdAt: string; expiresAt: string; lastUsedAt: string | null; revokedAt: string | null };
+export type ProvisionedState = "pending" | "active" | "deactivated";
+export type EnterpriseProvisionedUser = { id: string; userName: string; email: string | null; displayName: string | null; externalId: string | null; role: Role; state: ProvisionedState; createdAt: string; updatedAt: string; boundAt: string | null; deactivatedAt: string | null };
+export type EnterpriseAuditEvent = { id: string; chain_seq: string; actor_subject: string | null; action: string; resource_type: string | null; resource_id: string | null; request_id: string | null; ip_address: string | null; details: Record<string, unknown>; created_at: string; prev_hash: string; row_hash: string };
+export type AuditVerification = { valid: boolean; checked: number; firstBadSeq: number | null; lastSeq: number | null; headHash: string | null; complete: boolean; nextFromSeq: number | null };
+export type AuditQuery = { action?: string; from?: string; to?: string; cursor?: string };
 export type WebhookEvent = "job.finished";
 export type EnterpriseWebhook = { id: string; name: string; url: string; events: WebhookEvent[]; enabled: boolean; secretVersion: number; createdBy: string; createdAt: string; updatedAt: string };
 export type WebhookDeliveryStatus = "pending" | "delivered" | "failed";
@@ -89,6 +95,30 @@ export function rotateWebhookSecret(apiUrl: string, token: string, workspaceId: 
 export function pingWebhook(apiUrl: string, token: string, workspaceId: string, webhookId: string): Promise<{ deliveryId: string }> { return enterpriseRequest(apiUrl, token, `${webhookPath(workspaceId, webhookId)}/ping`, json("POST")); }
 export function listWebhookDeliveries(apiUrl: string, token: string, workspaceId: string, webhookId: string): Promise<EnterpriseWebhookDelivery[]> { return enterpriseRequest(apiUrl, token, `${webhookPath(workspaceId, webhookId)}/deliveries?limit=25`); }
 export function redeliverWebhook(apiUrl: string, token: string, workspaceId: string, webhookId: string, deliveryId: string): Promise<{ deliveryId: string }> { return enterpriseRequest(apiUrl, token, `${webhookPath(workspaceId, webhookId)}/deliveries/${encodeURIComponent(deliveryId)}/redeliver`, json("POST")); }
+
+// The trail, newest first. The next-page cursor travels in a response header, so this reads the response itself.
+export async function listAuditEvents(apiUrl: string, token: string, workspaceId: string, query: AuditQuery = {}, limit = 50): Promise<{ events: EnterpriseAuditEvent[]; next: string | null }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  for (const [key, value] of Object.entries(query)) if (value) params.set(key, value);
+  const response = await fetch(`${apiUrl.replace(/\/$/, "")}${workspacePath(workspaceId)}/audit-events?${params}`, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+  const body: unknown = await response.json().catch(() => ({}));
+  if (!response.ok) throw new EnterpriseApiError(body && typeof body === "object" && "error" in body && typeof body.error === "string" ? body.error : `Request failed (${response.status})`, response.status, body && typeof body === "object" && "details" in body ? body.details : undefined);
+  return { events: body as EnterpriseAuditEvent[], next: response.headers.get("x-next-cursor") };
+}
+export function verifyAudit(apiUrl: string, token: string, workspaceId: string, fromSeq = 0): Promise<AuditVerification> { return enterpriseRequest(apiUrl, token, `${workspacePath(workspaceId)}/audit/verify?fromSeq=${fromSeq}`); }
+// The export needs the Authorization header, so it is fetched here and saved by the caller, like the JUnit file.
+export async function fetchAuditExport(apiUrl: string, token: string, workspaceId: string): Promise<Blob> {
+  const response = await fetch(`${apiUrl.replace(/\/$/, "")}${workspacePath(workspaceId)}/audit-events/export.ndjson`, { headers: { authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new EnterpriseApiError(`Request failed (${response.status})`, response.status);
+  return response.blob();
+}
+
+// Provisioning (SCIM): the token an identity provider presents, and the people it has provisioned. The token in the response is shown once.
+export function listScimTokens(apiUrl: string, token: string, workspaceId: string): Promise<EnterpriseScimToken[]> { return enterpriseRequest(apiUrl, token, `${workspacePath(workspaceId)}/scim/tokens`); }
+export function createScimToken(apiUrl: string, token: string, workspaceId: string, name: string, expiresInDays?: number): Promise<EnterpriseScimToken & { token: string }> { return enterpriseRequest(apiUrl, token, `${workspacePath(workspaceId)}/scim/tokens`, json("POST", { name, ...(expiresInDays ? { expiresInDays } : {}) })); }
+export function revokeScimToken(apiUrl: string, token: string, workspaceId: string, tokenId: string): Promise<void> { return enterpriseRequest(apiUrl, token, `${workspacePath(workspaceId)}/scim/tokens/${encodeURIComponent(tokenId)}`, json("DELETE")); }
+export function listProvisionedUsers(apiUrl: string, token: string, workspaceId: string): Promise<EnterpriseProvisionedUser[]> { return enterpriseRequest(apiUrl, token, `${workspacePath(workspaceId)}/scim/users`); }
+export const scimBaseUrl = (apiUrl: string): string => `${apiUrl.replace(/\/$/, "")}/scim/v2`;
 
 // Incremental Server-Sent Events parser: feed it decoded text in any chunking; it reports each complete event once.
 export function createSseParser(onEvent: (event: string, data: string) => void): (chunk: string) => void {

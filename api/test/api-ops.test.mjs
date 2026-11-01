@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { createApp } from "../src/app.mjs";
 import { createDatabase } from "../src/db.mjs";
 import { MigrationError, migrate } from "../src/migrate.mjs";
 import { DEV_TOKEN, MIGRATION_NAMES, createClient, createTestDatabase, skip, sleep, startApi, startIssuer, waitFor, ws } from "./helpers.mjs";
@@ -89,7 +92,33 @@ test("a burst of valid requests, larger than the failure budget, is not mistaken
   const bad = []; for (let i = 0; i < 5; i += 1) bad.push(await client("/v1/workspaces", { token: `wrong-token-${i}` }));
   assert.deepEqual(bad.map((response) => response.status), [401, 401, 401, 429, 429], "real failures still lock the address");
   assert.ok(Number(bad[3].headers.get("retry-after")) >= 1, "and the refusal says when to come back");
-  assert.equal((await client("/v1/workspaces")).status, 429, "a locked address is refused whatever it sends (documented shared-address tradeoff)");
+  assert.equal((await client("/v1/workspaces", { token: "wpk_never-seen-before" })).status, 429, "a locked address still refuses credentials it has not seen");
+});
+
+test("a locked address still serves the credentials this replica verified, so one guesser does not lock out a shared office address", { skip }, async () => {
+  const app = await launch({ AUTH_FAILURE_LIMIT_PER_MINUTE: "3" });
+  const colleague = createClient(app.url, await issuer.sign({ sub: "colleague" }));
+  const stranger = createClient(app.url, await issuer.sign({ sub: "not-yet-seen" }));
+  const operator = createClient(app.url, DEV_TOKEN);
+  const gateway = (await operator(`${ws(workspaceId)}/gateways`, { method: "POST", body: { name: "nat-gw" } })).body;
+  const key = (await operator(`${ws(workspaceId)}/api-keys`, { method: "POST", body: { name: "nat-key", role: "viewer" } })).body;
+  assert.equal((await colleague("/v1/workspaces")).status, 200);
+  assert.equal((await createClient(app.url, gateway.token)("/gateway/v1/heartbeat", { method: "POST", body: {} })).status, 200);
+  assert.equal((await createClient(app.url, key.token)(`${ws(workspaceId)}/gateways`)).status, 200);
+
+  const guesses = []; for (let i = 0; i < 5; i += 1) guesses.push((await colleague("/v1/workspaces", { token: `guess-${i}` })).status);
+  assert.deepEqual(guesses, [401, 401, 401, 429, 429], "the address is locked by the guesser");
+
+  assert.equal((await colleague("/v1/workspaces")).status, 200, "a signed-in colleague on the same address is not");
+  assert.equal((await operator("/v1/workspaces")).status, 200);
+  assert.equal((await createClient(app.url, gateway.token)("/gateway/v1/heartbeat", { method: "POST", body: {} })).status, 200, "nor is a gateway behind it");
+  assert.equal((await createClient(app.url, key.token)(`${ws(workspaceId)}/gateways`)).status, 200, "nor an API key");
+  assert.equal((await stranger("/v1/workspaces")).status, 429, "a valid credential this replica has not verified yet waits out the window like any other");
+  assert.equal((await colleague("/v1/workspaces", { token: "guess-again" })).status, 429, "and the guesser stays locked");
+
+  // The shortcut skips only the throttle: a credential revoked after it was cached fails the real check, and is counted as a failure.
+  assert.equal((await operator(`${ws(workspaceId)}/api-keys/${key.id}`, { method: "DELETE" })).status < 300, true);
+  assert.equal((await createClient(app.url, key.token)(`${ws(workspaceId)}/gateways`)).status, 401);
 });
 
 test("each gateway has its own request budget", { skip }, async () => {
@@ -146,6 +175,49 @@ test("production without a metrics token hides /metrics, and rejects the dev cre
   assert.ok(app.config.warnings.length >= 1);
 });
 
+test("one workspace cannot fill an instance's live streams: its own cap answers 429 while another workspace still connects", { skip }, async () => {
+  const app = await launch({ SSE_MAX_CLIENTS_PER_WORKSPACE: "2" });
+  const operator = createClient(app.url, DEV_TOKEN);
+  const crowded = (await operator("/v1/workspaces", { method: "POST", body: { name: "crowded" } })).body.id;
+  const quiet = (await operator("/v1/workspaces", { method: "POST", body: { name: "quiet" } })).body.id;
+  const open = async (id) => { const controller = new AbortController(); const response = await fetch(`${app.url}${ws(id)}/test-jobs/stream`, { headers: { authorization: `Bearer ${DEV_TOKEN}` }, signal: controller.signal }); return { response, close: () => controller.abort() }; };
+  const opened = [];
+  try {
+    opened.push(await open(crowded), await open(crowded));
+    assert.deepEqual(opened.map((stream) => stream.response.status), [200, 200]);
+    const refused = await open(crowded);
+    assert.equal(refused.response.status, 429);
+    assert.deepEqual(await refused.response.json(), { error: "too_many_streams_for_workspace" });
+    const other = await open(quiet); opened.push(other);
+    assert.equal(other.response.status, 200, "the other workspace is not affected");
+    opened[0].close();
+    await waitFor(async () => (await open(crowded).then((stream) => { opened.push(stream); return stream.response.status; })) === 200, { message: "a slot to free up when a stream closes" });
+  } finally { for (const stream of opened) stream.close(); }
+});
+
+test("readiness fails for a database that is reachable but read-only (a replica, a demoted primary)", { skip }, async () => {
+  const logger = { info() {}, warn() {}, error() {}, debug() {}, child() { return logger; } };
+  const writable = createDatabase({ url: database.url, poolSize: 2, log: logger });
+  const readOnly = createDatabase({ url: `${database.url}?options=-c%20default_transaction_read_only%3Don`, poolSize: 2, log: logger });
+  const readOnlyApp = createApp({ config: primary.config, db: readOnly, log: logger });
+  const server = http.createServer(readOnlyApp.app);
+  await new Promise((resolve) => { server.listen(0, "127.0.0.1", resolve); });
+  try {
+    assert.deepEqual(await writable.health(), { readOnly: false });
+    assert.deepEqual(await readOnly.health(), { readOnly: true });
+    const ready = await fetch(`http://127.0.0.1:${server.address().port}/readyz`);
+    assert.equal(ready.status, 503);
+    assert.deepEqual(await ready.json(), { status: "unavailable", checks: { database: "read_only" } });
+    // Liveness does not look at the database: a read-only primary must not get its pods restarted.
+    assert.equal((await fetch(`http://127.0.0.1:${server.address().port}/healthz`)).status, 200);
+    // And the instance with a writable database is ready.
+    assert.equal((await fetch(`${primary.url}/readyz`)).status, 200);
+  } finally {
+    await new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); });
+    await writable.close(); await readOnly.close(); await readOnlyApp.stream.stop();
+  }
+});
+
 test("shutdown drains: open streams end, the port closes, and it returns promptly", { skip }, async () => {
   const app = await launch();
   const controller = new AbortController();
@@ -160,6 +232,22 @@ test("shutdown drains: open streams end, the port closes, and it returns promptl
   assert.notEqual(ended, "still open", "the stream must be closed by shutdown");
   controller.abort();
   await assert.rejects(fetch(`${app.url}/healthz`), "port is closed");
+});
+
+test("shutdown drain: responses close their connection, new connections are still served, then the port closes", { skip }, async () => {
+  const app = await launch();
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const get = (path) => new Promise((resolve, reject) => { http.get(`${app.url}${path}`, { agent }, (res) => { res.resume(); res.on("end", () => resolve({ status: res.statusCode, connection: res.headers.connection })); }).on("error", reject); });
+  try {
+    assert.deepEqual(await get("/healthz"), { status: 200, connection: "keep-alive" });
+    const stopping = app.instance.shutdown({ graceMs: 1000, drainMs: 800 });
+    await sleep(150);
+    assert.deepEqual(await get("/healthz"), { status: 200, connection: "close" }, "the kept-alive connection is told to close");
+    assert.equal((await fetch(`${app.url}/healthz`)).status, 200, "a new connection is still accepted during the drain");
+    assert.equal((await fetch(`${app.url}/readyz`)).status, 503, "readiness already reports not ready");
+    await stopping;
+    await assert.rejects(fetch(`${app.url}/healthz`), "the port is closed afterwards");
+  } finally { agent.destroy(); }
 });
 
 const freshEnv = (url, extra = {}) => ({ DATABASE_URL: url, PORT: "0", DEV_BEARER_TOKEN: DEV_TOKEN, LOG_LEVEL: "info", ...extra });
@@ -236,4 +324,74 @@ test("retention does nothing unless explicitly enabled", { skip }, async () => {
   const retention = startRetention({ db: primary.db, config: { retention: { jobsDays: 0, reportsDays: 0, auditDays: 0, intervalHours: 24 } }, log: primary.log, metrics: createMetrics({ db: primary.db }) });
   await retention.runOnce(); retention.stop();
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM audit_events")).rows[0].n, before);
+});
+
+test("migrations: a migration that cannot get its table lock gives up instead of holding back every other query on that table", { skip }, async () => {
+  const logger = { info() {}, warn() {}, error() {} };
+  const database = await createTestDatabase();
+  const extra = await fs.mkdtemp(path.join(os.tmpdir(), "wp-migrations-"));
+  const holder = new pg.Client({ connectionString: database.url });
+  const reader = new pg.Pool({ connectionString: database.url, max: 3 });
+  const db = createDatabase({ url: database.url, poolSize: 3, log: logger });
+  try {
+    await migrate(db, { log: logger });
+    for (const name of await fs.readdir(path.join(root, "migrations"))) await fs.copyFile(path.join(root, "migrations", name), path.join(extra, name));
+    await fs.writeFile(path.join(extra, "999_probe.sql"), "ALTER TABLE test_jobs ADD COLUMN probe_column text;\n");
+
+    // One long transaction that has read the table, the situation of a report or a stuck client during a release.
+    await holder.connect(); await holder.query("BEGIN"); await holder.query("SELECT count(*) FROM test_jobs");
+
+    // Bounded: the ALTER waits 300 ms for its lock, fails, and nothing stays queued behind it.
+    const started = Date.now();
+    await assert.rejects(migrate(db, { log: logger, directory: extra, lockTimeoutMs: 300 }), (error) => error.code === "55P03");
+    assert.ok(Date.now() - started < 3000, "gave up quickly");
+    assert.equal((await reader.query("SELECT count(*)::int AS n FROM schema_migrations WHERE name = '999_probe.sql'")).rows[0].n, 0, "the failed migration was rolled back");
+    const unblocked = Date.now(); await reader.query("SELECT count(*) FROM test_jobs");
+    assert.ok(Date.now() - unblocked < 500, "readers are not held back after it gave up");
+
+    // Unbounded (0): the same migration queues for its lock and a reader behind it is blocked until the long transaction ends. This is the outage the bound prevents.
+    let migrated = false;
+    const unbounded = migrate(db, { log: logger, directory: extra, lockTimeoutMs: 0 }).then(() => { migrated = true; });
+    await sleep(700);
+    assert.equal(migrated, false);
+    let behind = false;
+    const blockedReader = reader.query("SELECT count(*) FROM test_jobs").then(() => { behind = true; });
+    await sleep(700);
+    assert.equal(behind, false, "a reader queued behind the waiting ALTER is blocked");
+    await holder.query("COMMIT");
+    await Promise.all([unbounded, blockedReader]);
+    assert.equal((await reader.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'test_jobs' AND column_name = 'probe_column'")).rows[0].n, 1);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => {}); await holder.end().catch(() => {});
+    await Promise.all([reader.end(), db.close()]); await fs.rm(extra, { recursive: true, force: true }); await database.drop();
+  }
+});
+
+test("migrations: a blocked migration retries with short lock waits, readers are only briefly held, and it applies once the long transaction ends", { skip }, async () => {
+  const logger = { info() {}, warn() {}, error() {} };
+  const database = await createTestDatabase();
+  const extra = await fs.mkdtemp(path.join(os.tmpdir(), "wp-migrations-"));
+  const holder = new pg.Client({ connectionString: database.url });
+  const reader = new pg.Pool({ connectionString: database.url, max: 2 });
+  const db = createDatabase({ url: database.url, poolSize: 3, log: logger });
+  try {
+    await migrate(db, { log: logger });
+    for (const name of await fs.readdir(path.join(root, "migrations"))) await fs.copyFile(path.join(root, "migrations", name), path.join(extra, name));
+    await fs.writeFile(path.join(extra, "999_probe.sql"), "ALTER TABLE test_jobs ADD COLUMN probe_column text;\n");
+    await holder.connect(); await holder.query("BEGIN"); await holder.query("SELECT count(*) FROM test_jobs");
+    setTimeout(() => { holder.query("COMMIT").catch(() => {}); }, 1500);
+
+    let slowest = 0; let running = true;
+    const probing = (async () => { while (running) { const t = Date.now(); await reader.query("SELECT count(*) FROM test_jobs"); slowest = Math.max(slowest, Date.now() - t); await sleep(25); } })();
+    const started = Date.now();
+    await migrate(db, { log: logger, directory: extra, lockTimeoutMs: 200, lockRetryMs: 10_000 });
+    running = false; await probing;
+    assert.ok(Date.now() - started >= 1000, "it had to wait for the long transaction");
+    assert.ok(slowest < 800, `a reader was held for ${slowest} ms; each attempt may hold readers only for about the lock timeout`);
+    assert.equal((await reader.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'test_jobs' AND column_name = 'probe_column'")).rows[0].n, 1);
+    assert.equal((await reader.query("SELECT count(*)::int AS n FROM schema_migrations WHERE name = '999_probe.sql'")).rows[0].n, 1);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => {}); await holder.end().catch(() => {});
+    await Promise.all([reader.end(), db.close()]); await fs.rm(extra, { recursive: true, force: true }); await database.drop();
+  }
 });

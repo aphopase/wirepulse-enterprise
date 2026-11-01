@@ -64,6 +64,19 @@ test("errors are structured JSON with a request id and no internals", { skip }, 
   for (const response of [notFound, badId, badJson, invalid, huge]) assert.doesNotMatch(response.text, /node_modules|\.mjs|\n\s+at \S+ \(/);
 });
 
+test("a NUL character in text, a query parameter or JSON is refused as an invalid value, not met as a database error", { skip }, async () => {
+  // PostgreSQL text and jsonb cannot hold U+0000. An OWASP ZAP scan found workspace names and query strings answering 500 for it.
+  const nul = "a\u0000b";
+  const cases = {
+    "a text column": await admin("/v1/workspaces", { method: "POST", body: { name: nul } }),
+    "a query parameter": await admin(`${ws(workspaceId)}/audit-events?action=a%00b`),
+    "a jsonb value": await admin(`${ws(workspaceId)}/test-suites`, { method: "POST", body: { name: "nul-json", definition: { tests: [], note: nul } } })
+  };
+  for (const [what, response] of Object.entries(cases)) assert.deepEqual([response.status, response.body.error], [400, "invalid_value"], what);
+  const literal = await admin("/v1/workspaces", { method: "POST", rawBody: '{"name":"a\\\\u0000b"}' });
+  assert.deepEqual([literal.status, literal.body.name], [201, "a\\u0000b"], "a backslash followed by the text u0000 is ordinary text");
+});
+
 test("requests without a usable credential are rejected", { skip }, async () => {
   const anonymous = createClient(api.url);
   assert.equal((await anonymous("/v1/workspaces")).status, 401);

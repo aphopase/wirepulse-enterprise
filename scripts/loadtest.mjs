@@ -7,7 +7,9 @@
 // Each workspace gets simulated gateways that claim, start and complete jobs with real, verifiable evidence (the gateway's engine
 // runs a one-test suite against a simulated device), while submitters queue jobs and readers poll lists and usage. Afterwards the
 // script checks what matters more than speed: every submitted job was handed out once and ended `passed`, no response was a 5xx,
-// and each workspace's audit hash chain still verifies. The exit code is 1 if any of that failed. Latencies are measured by this
+// and each workspace's audit hash chain still verifies. A job whose completion was refused (a failover) and that is handed out again
+// after its lease ran out is counted apart, as "redelivered": that is the documented at-least-once behaviour, not a double hand-out.
+// The exit code is 1 if any of that failed. Latencies are measured by this
 // process on the machine it runs on; treat them as a baseline for one setup, not as a capacity promise.
 import crypto from "node:crypto";
 import { runSuite } from "../gateway/src/engine.mjs";
@@ -64,7 +66,7 @@ for (let w = 0; w < WORKSPACES; w += 1) {
 }
 
 const startedAt = Date.now(); const deadline = startedAt + SECONDS * 1000; const hardStop = deadline + 90_000;
-const claimed = new Set(); let duplicateClaims = 0; let completed = 0; let submittedOk = 0; let submitting = SUBMITTERS; let sequence = 0;
+const claimed = new Set(); const unconfirmed = new Set(); let duplicateClaims = 0; let redelivered = 0; let completed = 0; let submittedOk = 0; let submitting = SUBMITTERS; let sequence = 0;
 
 async function submitter(index) {
   while (Date.now() < deadline) {
@@ -89,11 +91,11 @@ async function gateway(token) {
     const claim = await call("gateway.claim", "/gateway/v1/jobs/claim", { method: "POST", token });
     if (claim.status !== 200) { await sleep(claim.status === 204 ? 25 : 100); continue; }
     const id = claim.body.id;
-    if (claimed.has(id)) duplicateClaims += 1;
+    if (claimed.has(id)) { if (unconfirmed.delete(id)) redelivered += 1; else duplicateClaims += 1; } // redelivered: its last completion was refused
     claimed.add(id);
     await call("gateway.start", `/gateway/v1/jobs/${id}/start`, { method: "POST", token });
     const done = await call("gateway.complete", `/gateway/v1/jobs/${id}/complete`, { method: "POST", body: { results, evidence }, token });
-    if (done.status === 200) completed += 1;
+    if (done.status === 200) completed += 1; else unconfirmed.add(id);
   }
 }
 
@@ -104,19 +106,23 @@ await Promise.all([
 ]);
 const elapsed = (Date.now() - startedAt) / 1000;
 
-// What the server says happened, not what this process remembers.
+// What the server says happened, not what this process remembers. The load above can have used up this token's request budget (the
+// default is 240 a minute per user), and the checks below must not fail for that: they wait out a 429 and ask again.
+const verify = async (label, path) => { for (let attempt = 0; attempt < 45; attempt += 1) { const response = await call(label, path); if (response.status !== 429) return response; await sleep(2000); } return call(label, path); };
 const problems = [];
 const serverView = [];
 for (const workspace of workspaces) {
   const tally = {}; let seen = 0; let cursor = null;
   do {
-    const page = await call("verify.jobs", `/v1/workspaces/${workspace.id}/test-jobs?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+    const page = await verify("verify.jobs", `/v1/workspaces/${workspace.id}/test-jobs?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
     if (page.status !== 200) { problems.push(`listing jobs of ${workspace.id} failed with HTTP ${page.status}`); break; }
     for (const job of page.body) { tally[job.status] = (tally[job.status] ?? 0) + 1; seen += 1; if (!workspace.submitted.has(job.id)) problems.push(`job ${job.id} is not one this run submitted`); }
     cursor = page.headers.get("x-next-cursor");
   } while (cursor);
-  const audit = await call("verify.audit", `/v1/workspaces/${workspace.id}/audit/verify`);
-  serverView.push({ workspaceId: workspace.id, submitted: workspace.submitted.size, listed: seen, statuses: tally, auditValid: audit.body?.valid ?? false, auditEventsChecked: audit.body?.checked ?? 0 });
+  // One call checks at most 500,000 events; follow nextFromSeq so that the whole chain is checked, however long the run was.
+  let audit = await verify("verify.audit", `/v1/workspaces/${workspace.id}/audit/verify`); let auditChecked = audit.body?.checked ?? 0;
+  while (audit.body?.valid === true && audit.body.complete === false) { audit = await verify("verify.audit", `/v1/workspaces/${workspace.id}/audit/verify?fromSeq=${audit.body.nextFromSeq}`); auditChecked += audit.body?.checked ?? 0; }
+  serverView.push({ workspaceId: workspace.id, submitted: workspace.submitted.size, listed: seen, statuses: tally, auditValid: audit.body?.valid ?? false, auditEventsChecked: auditChecked });
   if (seen !== workspace.submitted.size) problems.push(`workspace ${workspace.id}: submitted ${workspace.submitted.size}, the server lists ${seen}`);
   if ((tally.passed ?? 0) !== workspace.submitted.size) problems.push(`workspace ${workspace.id}: ${tally.passed ?? 0} of ${workspace.submitted.size} jobs passed (${JSON.stringify(tally)})`);
   if (audit.body?.valid !== true) problems.push(`workspace ${workspace.id}: the audit chain does not verify (${JSON.stringify(audit.body)})`);
@@ -135,7 +141,7 @@ const rows = [...samples].filter(([label]) => label !== "setup" && label !== "ve
 }).sort((a, b) => a.operation.localeCompare(b.operation));
 console.log(`target ${base}: ${SECONDS}s of load (${elapsed.toFixed(1)}s including the drain), ${WORKSPACES} workspaces x ${GATEWAYS} gateways, ${SUBMITTERS} submitters, ${READERS} readers`);
 console.table(rows.map(({ statuses: tally, ...row }) => ({ ...row, statuses: JSON.stringify(tally) })));
-console.log(`jobs submitted ${submittedOk}, completed ${completed}, handed out twice ${duplicateClaims}, completed per second ${(completed / elapsed).toFixed(1)}`);
+console.log(`jobs submitted ${submittedOk}, completed ${completed}, handed out twice ${duplicateClaims}, redelivered after a refused completion ${redelivered}, completed per second ${(completed / elapsed).toFixed(1)}`);
 for (const view of serverView) console.log(`workspace ${view.workspaceId}: ${view.listed}/${view.submitted} listed, ${JSON.stringify(view.statuses)}, audit chain ${view.auditValid ? "valid" : "BROKEN"} (${view.auditEventsChecked} events)`);
-console.log(`RESULT ${JSON.stringify({ ok: problems.length === 0, seconds: SECONDS, submitted: submittedOk, completed, duplicateClaims, jobsPerSecond: Number((completed / elapsed).toFixed(1)), operations: rows })}`);
+console.log(`RESULT ${JSON.stringify({ ok: problems.length === 0, seconds: SECONDS, submitted: submittedOk, completed, duplicateClaims, redelivered, jobsPerSecond: Number((completed / elapsed).toFixed(1)), operations: rows })}`);
 if (problems.length) { console.error(`FAILED:\n- ${problems.join("\n- ")}`); process.exit(1); }

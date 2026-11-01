@@ -44,5 +44,13 @@ export function createMetrics({ db }) {
     name: "wirepulse_gateways_online", help: "Gateways with a heartbeat in the last 90 seconds", registers: [registry],
     async collect() { this.set((await db.query("SELECT count(*)::int AS n FROM gateways WHERE revoked_at IS NULL AND last_heartbeat_at > now() - interval '90 seconds'")).rows[0].n); }
   });
+  // An expired SCIM token stops the identity provider removing leavers, and the IdP's own error is easy to miss: alert on this one.
+  new client.Gauge({
+    name: "wirepulse_scim_token_seconds_to_expiry", help: "Seconds until the soonest-expiring SCIM token that is not revoked expires (negative once it has; +Inf when there is none)", registers: [registry],
+    async collect() {
+      const seconds = (await db.query("SELECT EXTRACT(EPOCH FROM min(expires_at) - now())::float AS seconds FROM scim_tokens WHERE revoked_at IS NULL")).rows[0].seconds;
+      this.set(seconds ?? Infinity); // an unset gauge would read 0, which an alert takes for "expires now"
+    }
+  });
   return metrics;
 }

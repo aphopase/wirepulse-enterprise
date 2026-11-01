@@ -201,7 +201,7 @@ export function createAgent({ config, openTransport, fetchImpl = fetch, log = cr
           failures = ["local_failure", "delivery_failed", "not_started"].includes(outcome) ? failures + 1 : 0;
           if (!failures) continue;
         } else if (claim.status === 204) failures = 0;
-        else if (!stopping.signal.aborted) { failures += 1; log.warn("claim failed", { status: claim.status, error: claim.error }); }
+        else if (!stopping.signal.aborted) { failures += 1; log.warn("claim failed", { status: claim.status, error: claim.error, reason: claim.body?.error }); }
         await sleep(failures ? Math.max(backoff(failures), claim.retryAfterMs ?? 0) : config.pollMs, stopping.signal);
       }
     } finally { clearInterval(beat); clearTimeout(graceTimer); }

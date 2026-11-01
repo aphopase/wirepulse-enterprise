@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wirepulse-api
+  labels: { app.kubernetes.io/name: wirepulse-api }
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  # Never fewer ready replicas than desired during an upgrade: add one new, wait until it is ready, then remove one old.
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector:
+    matchLabels: { app.kubernetes.io/name: wirepulse-api }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: wirepulse-api }
+    spec:
+      serviceAccountName: wirepulse-api
+      automountServiceAccountToken: false
+      # The API stops listening the moment it gets SIGTERM, but endpoints and kube-proxy rules take a few seconds to drop a
+      # terminating pod. The preStop sleep keeps it serving until they have; 30 s covers the sleep, the 10 s drain and the exit.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000  # the mounted secret is owned by root: without this a non-root process cannot read it (EACCES)
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app.kubernetes.io/name: wirepulse-api } }
+      containers:
+        - name: api
+          image: wirepulse-api
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom: [{ configMapRef: { name: wirepulse-config } }]
+          env:
+            - { name: DATABASE_URL_FILE, value: /run/secrets/wirepulse/database_url }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }  # no CPU limit on purpose: CPU limits throttle bursts; the HPA scales on requests
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: secrets, mountPath: /run/secrets/wirepulse, readOnly: true }
+          lifecycle:
+            preStop: { exec: { command: ["sleep", "8"] } }
+          startupProbe:   { httpGet: { path: /healthz, port: http }, periodSeconds: 2, failureThreshold: 30 }
+          livenessProbe:  { httpGet: { path: /healthz, port: http }, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }  # never touches the database
+          readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 3, timeoutSeconds: 3, failureThreshold: 2, successThreshold: 1 }
+      volumes:
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+        - name: secrets
+          secret: { secretName: wirepulse-secrets, defaultMode: 0440 }

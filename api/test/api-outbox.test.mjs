@@ -387,6 +387,29 @@ test("two instances on one database never deliver the same message twice", { ski
   assert.ok((await messages(api, "delivered")) > before.api && (await messages(second, "delivered")) > before.second, "both instances did part of the work");
 });
 
+test("deliveries are taken in turns across workspaces: a workspace with a large backlog does not make another wait behind it", { skip }, async (t) => {
+  const { pool: db, kit: K2 } = await isolated(t);
+  const slow = await startReceiver((_req, res) => { setTimeout(() => { res.statusCode = 200; res.end("ok"); }, 300); });
+  const quick = await startReceiver(ok);
+  t.after(async () => { await slow.close(); await quick.close(); });
+  const big = await K2.workspace(t, "big"); const small = await K2.workspace(t, "small");
+  const bigHook = await K2.hook(big, `${slow.url}/big`); const smallHook = await K2.hook(small, `${quick.url}/small`);
+  // The big workspace's 200 deliveries are all older than the small one's 3, and they all become due in the same instant.
+  const client = await db.connect();
+  let smallIds;
+  try {
+    await client.query("BEGIN");
+    await client.query(`INSERT INTO outbox (workspace_id, kind, webhook_id, event_type, payload, next_attempt_at) SELECT $1, 'webhook', $2, 'webhook.ping', '{"message":"big"}'::jsonb, now() - interval '10 minutes' + n * interval '1 second' FROM generate_series(1, 200) n`, [big, bigHook.id]);
+    smallIds = (await client.query(`INSERT INTO outbox (workspace_id, kind, webhook_id, event_type, payload) SELECT $1, 'webhook', $2, 'webhook.ping', '{"message":"small"}'::jsonb FROM generate_series(1, 3) RETURNING id`, [small, smallHook.id])).rows.map((row) => row.id);
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  // Behind the big backlog (20 per batch, 300 ms each batch) they would wait about three seconds; in turns they go out with the first batch.
+  await waitFor(async () => (await db.query("SELECT count(*)::int AS n FROM outbox WHERE id = ANY($1) AND status = 'delivered'", [smallIds])).rows[0].n === 3, { timeoutMs: 2000, message: "the small workspace's deliveries to go out in the first batches" });
+  const bigDone = (await db.query("SELECT count(*)::int AS n FROM outbox WHERE workspace_id = $1 AND status = 'delivered'", [big])).rows[0].n;
+  assert.ok(bigDone < 100, `the big workspace had delivered ${bigDone} of 200 when the small one finished`);
+  assert.ok(slow.requests.length > 0, "and the big workspace is being served too");
+});
+
 test("a delivery that another transaction is holding does not hold up the others", { skip }, async (t) => {
   const target = await startReceiver(ok);
   t.after(() => target.close());
@@ -449,6 +472,8 @@ test("old deliveries are pruned, abandoned ones are closed out, and live or wait
     abandonedEmail: await add("email", "pending", { attempts: 8, payload: email })
   };
   await waitFor(async () => (await solo.kit.row(rows.abandoned))?.status === "failed", { timeoutMs: 15_000, message: "the first cleanup" });
+  // The cleanup closes abandoned rows first and deletes expired ones in a second statement: wait for that one too, or the checks below can run in between.
+  await waitFor(async () => !(await solo.kit.row(rows.oldDelivered)), { timeoutMs: 15_000, message: "the retention delete" });
   const present = async (id) => Boolean(await solo.kit.row(id));
   assert.deepEqual([await present(rows.oldDelivered), await present(rows.oldFailed), await present(rows.oldEmail)], [false, false, false], "finished rows past retention are deleted");
   assert.deepEqual([await present(rows.recentDelivered), await present(rows.waiting)], [true, true], "recent and waiting rows stay");

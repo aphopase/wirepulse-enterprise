@@ -13,6 +13,6 @@ const log = createLogger({ level: config.logLevel });
 const db = createDatabase({ url: config.databaseUrl, poolSize: 2, ssl: config.db.ssl, connectTimeoutMs: config.db.connectTimeoutMs, log });
 try {
   if (process.argv.includes("--status")) { const pending = await pendingMigrations(db); log.info({ pending }, pending.length ? "migrations pending" : "schema is up to date"); process.exitCode = pending.length ? 2 : 0; }
-  else { await migrate(db, { log }); log.info("schema is up to date"); }
+  else { await migrate(db, { log, lockTimeoutMs: config.migrateLockTimeoutMs, lockRetryMs: config.migrateLockRetryMs }); log.info("schema is up to date"); }
 } catch (error) { log.error({ err: error }, "migration failed"); process.exitCode = 1; }
 finally { await db.close(); }

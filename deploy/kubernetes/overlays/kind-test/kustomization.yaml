@@ -1,0 +1,41 @@
+# TEST ONLY. Runs WirePulse on a throwaway kind cluster with an in-cluster PostgreSQL and Redis, development authentication and fixed
+# passwords. Never deploy this overlay; production uses the base with your own database, secrets, identity provider and ingress.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - postgres.yaml
+  - redis.yaml
+generatorOptions: { disableNameSuffixHash: true }
+secretGenerator:
+  - name: wirepulse-secrets
+    namespace: wirepulse
+    literals: ["database_url=postgres://wirepulse:testpw@postgres:5432/wirepulse"]
+  - name: postgres-auth
+    namespace: wirepulse
+    literals: ["password=testpw"]
+patches:
+  - target: { kind: ConfigMap, name: wirepulse-config }
+    patch: |-
+      - { op: replace, path: /data/NODE_ENV, value: development }
+      - { op: replace, path: /data/TRUST_PROXY, value: "" }
+      - { op: replace, path: /data/CORS_ORIGINS, value: "" }
+      - { op: replace, path: /data/OIDC_ISSUER, value: "" }
+      - { op: replace, path: /data/OIDC_AUDIENCE, value: "" }
+      - { op: add, path: /data/DEV_BEARER_TOKEN, value: k8s-test-token-7f3a9c }
+      - { op: add, path: /data/METRICS_TOKEN, value: k8s-test-metrics-token-0123456789 }
+      - { op: add, path: /data/REDIS_URL, value: "redis://redis:6379" }
+      - { op: add, path: /data/RATE_LIMIT_PER_MINUTE, value: "1000000" }
+      - { op: add, path: /data/RATE_LIMIT_IP_PER_MINUTE, value: "1000000" }
+      - { op: add, path: /data/GATEWAY_RATE_LIMIT_PER_MINUTE, value: "1000000" }
+  - target: { kind: Service, name: wirepulse-api }
+    patch: |-
+      - { op: add, path: /spec/type, value: NodePort }
+      - { op: replace, path: /spec/ports/0/nodePort, value: 30080 }
+  # The test overlay removes the base policy so that its local fixture services remain reachable.
+  - target: { kind: NetworkPolicy, name: wirepulse-api }
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: { name: wirepulse-api }

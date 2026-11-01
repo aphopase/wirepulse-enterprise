@@ -11,7 +11,7 @@ import { DEV_TOKEN, createClient, createTestDatabase, sampleDefinition, skip, sl
 
 const CLI = path.join(import.meta.dirname, "..", "src", "admin-cli.mjs");
 // Everything a workspace owns, as the purge worker sees it.
-const OWNED = ["outbox", "webhooks", "test_reports", "test_jobs", "resource_versions", "test_suites", "shared_profiles", "gateways", "api_keys", "workspace_invitations", "workspace_members", "workspace_usage"];
+const OWNED = ["outbox", "webhooks", "test_reports", "test_jobs", "resource_versions", "test_suites", "shared_profiles", "gateways", "api_keys", "scim_group_members", "scim_groups", "scim_users", "scim_tokens", "workspace_invitations", "workspace_members", "workspace_usage"];
 
 let dbA; let dbB; let issuer; let api; let capped; let purgerOne; let purgerTwo; let poolA; let poolB; let admin; let adminB;
 const as = async (client, sub, options = {}) => createClient(client.url, await issuer.sign({ sub, ...options }));
@@ -106,8 +106,15 @@ test("deleting stops everything at once: access, jobs, gateways, keys, invitatio
   const target = await populate("Offboard Me");
   const alice = await as(api, "alice");
   await poolA.query("INSERT INTO workspace_members (workspace_id, subject, email, role) VALUES ($1, 'alice', 'alice@example.com', 'viewer')", [target.workspaceId]);
+  // An identity provider is connected to it as well: its token and a person it provisioned.
+  await poolA.query("INSERT INTO scim_tokens (workspace_id, name, token_hash, token_prefix, created_by, expires_at) VALUES ($1, 'idp', encode(sha256('wps_offboarding-test'::bytea), 'hex'), 'wps_offboard', 'dev-admin', now() + interval '1 day')", [target.workspaceId]);
+  const provisioned = (await poolA.query("INSERT INTO scim_users (workspace_id, user_name, email, created_by) VALUES ($1, 'pat@example.com', 'pat@example.com', 'scim:test') RETURNING id", [target.workspaceId])).rows[0];
+  const group = (await poolA.query("INSERT INTO scim_groups (workspace_id, display_name, created_by) VALUES ($1, 'hardware', 'scim:test') RETURNING id", [target.workspaceId])).rows[0];
+  await poolA.query("INSERT INTO scim_group_members (workspace_id, group_id, user_id) VALUES ($1, $2, $3)", [target.workspaceId, group.id, provisioned.id]);
+  const scim = createClient(api.url, "wps_offboarding-test");
+  assert.equal((await scim("/scim/v2/Users")).status, 200);
   const before = await counts(poolA, target.workspaceId);
-  assert.deepEqual(before, { outbox: 3, webhooks: 1, test_reports: 1, test_jobs: 2, resource_versions: 2, test_suites: 1, shared_profiles: 1, gateways: 1, api_keys: 1, workspace_invitations: 1, workspace_members: 2, workspace_usage: 1 });
+  assert.deepEqual(before, { outbox: 3, webhooks: 1, test_reports: 1, test_jobs: 2, resource_versions: 2, test_suites: 1, shared_profiles: 1, gateways: 1, api_keys: 1, scim_group_members: 1, scim_groups: 1, scim_users: 1, scim_tokens: 1, workspace_invitations: 1, workspace_members: 2, workspace_usage: 1 });
   assert.equal((await alice(`${ws(target.workspaceId)}/test-suites`)).status, 200);
 
   const done = await remove(admin, target.workspaceId, "Offboard Me");
@@ -121,6 +128,7 @@ test("deleting stops everything at once: access, jobs, gateways, keys, invitatio
     assert.equal((await request(`${ws(target.workspaceId)}/test-suites`)).status, 403);
   }
   assert.equal((await createClient(api.url, target.keyToken)(`${ws(target.workspaceId)}/usage`)).status, 401, "its API keys are revoked");
+  assert.equal((await scim("/scim/v2/Users")).status, 401, "its SCIM token is revoked");
   assert.equal((await target.gateway("/gateway/v1/jobs/claim", { method: "POST" })).status, 401, "the gateway can no longer claim work");
   assert.equal((await target.gateway(`/gateway/v1/jobs/${target.runningJob}/start`, { method: "POST" })).status, 401);
   assert.ok(!(await admin("/v1/workspaces")).body.some((item) => item.id === target.workspaceId), "it disappears from the list");

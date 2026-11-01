@@ -49,6 +49,14 @@ export function publicJob(row, { detail = false } = {}) {
 export const JOB_COLUMNS = "id, workspace_id, suite_id, requested_by, status, gateway_id, priority, requirements, progress, summary, error, attempts, max_attempts, version, suite_version, profile_id, profile_version, definition_hash, agent_version, engine_fingerprint, created_at, started_at, finished_at, lease_expires_at";
 export const JOB_DETAIL_COLUMNS = `${JOB_COLUMNS}, definition, result`;
 
+// PostgreSQL stopped, starting, shutting down or unreachable: its own codes (class 08, 25P03, 57P01-03) and the plain socket and pool
+// errors that carry no SQLSTATE (seen while restarting it: ECONNREFUSED, ENOTFOUND for the service name, "Connection terminated").
+// 25006: a write that reached a primary which had just been demoted to read-only (seen in a Patroni partition test, before the balancer
+// stopped sending it traffic).
+const UNREACHABLE = new Set(["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EPIPE", "25006", "25P03", "57P01", "57P02", "57P03"]);
+export const isDatabaseUnavailable = (error) =>
+  UNREACHABLE.has(error?.code) || String(error?.code ?? "").startsWith("08") || /^Connection terminated|not queryable|timeout exceeded when trying to connect/.test(error?.message ?? "");
+
 // Maps known failures to stable client-facing codes. Anything else is a 500 that never leaks internals.
 export function errorHandler({ log, metrics }) {
   return (error, req, res, _next) => {
@@ -63,11 +71,11 @@ export function errorHandler({ log, metrics }) {
       case "23505": return reply(409, "conflict");
       case "23503": return reply(409, "referenced_resource_missing");
       case "23001": return reply(409, "operation_not_permitted");
-      case "22P02": case "22007": case "22003": return reply(400, "invalid_value");
+      case "22P02": case "22007": case "22003": case "22021": case "22P05": return reply(400, "invalid_value"); // 22021/22P05: a NUL character, which PostgreSQL text and jsonb cannot hold
       case "57014": metrics?.dbTimeouts.inc(); (req.log ?? log).error({ err: error }, "database statement timeout"); return reply(503, "database_timeout");
-      case "57P01": case "08006": case "08001": case "08003": (req.log ?? log).error({ err: error }, "database unavailable"); return reply(503, "database_unavailable");
       default: break;
     }
+    if (isDatabaseUnavailable(error)) { (req.log ?? log).error({ err: error }, "database unavailable"); return reply(503, "database_unavailable"); }
     (req.log ?? log).error({ err: error }, "unhandled request error");
     return reply(500, "internal_error");
   };

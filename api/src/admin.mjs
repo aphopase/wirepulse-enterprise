@@ -7,6 +7,8 @@ import { limitsFor } from "./plans.mjs";
 import { invitationMessage } from "./mail.mjs";
 import { enqueueEmail } from "./outbox.mjs";
 import { enforce, lockWorkspace, meter, usageOf } from "./quota.mjs";
+import { bindProvisioned, revokeKeysCreatedBy } from "./provision.mjs";
+import { announceRevoked } from "./stream.mjs";
 
 const ROLES = ["viewer", "engineer", "maintainer", "administrator"];
 const hash = /^[a-f0-9]{64}$/;
@@ -24,7 +26,9 @@ const invitationSchema = z.object({ email: z.string().trim().toLowerCase().email
 
 const publicItem = (row) => ({ id: row.id, name: row.name, definition: row.definition, createdAt: row.created_at, updatedAt: row.updated_at, version: row.version, updatedBy: row.updated_by });
 
-export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metrics }) {
+export function registerAdminRoutes(app, { db, system, config, auth, apiAudit, log, metrics }) {
+  // The routes that are not inside one workspace (create one, list mine, answer an invitation) use the unrestricted role: row-level security
+  // would show them nothing, since no workspace has been chosen yet.
   const ws = "/v1/workspaces/:workspaceId";
   const viewer = auth.requireRole("viewer"); const engineer = auth.requireRole("engineer");
   const maintainer = auth.requireRole("maintainer"); const administrator = auth.requireRole("administrator");
@@ -32,7 +36,7 @@ export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metr
   // ---- workspaces ----
   app.post("/v1/workspaces", requireHuman, h(async (req, res) => {
     const body = z.object({ name }).strict().parse(req.body);
-    const workspace = await db.transaction(async (client) => {
+    const workspace = await system.transaction(async (client) => {
       const cap = config.saas.maxWorkspacesPerUser;
       if (cap > 0) {
         // One user's creations are serialized so concurrent requests cannot count their way past the cap.
@@ -49,9 +53,11 @@ export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metr
   }));
 
   app.get("/v1/workspaces", h(async (req, res) => {
+    // Somebody an identity provider has provisioned gets their access the first time they look at their workspaces.
+    if (!req.identity.apiKey) await bindProvisioned(system, req);
     const rows = req.identity.apiKey
-      ? (await db.query("SELECT id, name, plan, $2::text AS role, created_at FROM workspaces WHERE id = $1 AND deleted_at IS NULL", [req.identity.apiKey.workspaceId, req.identity.apiKey.role])).rows
-      : (await db.query("SELECT w.id, w.name, w.plan, m.role, w.created_at FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id WHERE m.subject = $1 AND w.deleted_at IS NULL ORDER BY w.name LIMIT 500", [req.identity.subject])).rows;
+      ? (await system.query("SELECT id, name, plan, $2::text AS role, created_at FROM workspaces WHERE id = $1 AND deleted_at IS NULL", [req.identity.apiKey.workspaceId, req.identity.apiKey.role])).rows
+      : (await system.query("SELECT w.id, w.name, w.plan, m.role, w.created_at FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id WHERE m.subject = $1 AND w.deleted_at IS NULL ORDER BY w.name LIMIT 500", [req.identity.subject])).rows;
     res.json(rows.map((row) => ({ id: row.id, name: row.name, plan: row.plan, role: row.role, createdAt: row.created_at })));
   }));
 
@@ -72,6 +78,7 @@ export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metr
       await client.query("UPDATE test_jobs SET status = 'cancelled', lease_expires_at = NULL, finished_at = now(), version = version + 1 WHERE workspace_id = $1 AND status IN ('queued', 'assigned', 'running')", [req.workspaceId]);
       await client.query("UPDATE gateways SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [req.workspaceId]);
       await client.query("UPDATE api_keys SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [req.workspaceId]);
+      await client.query("UPDATE scim_tokens SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [req.workspaceId]);
       await client.query("UPDATE workspace_invitations SET revoked_at = now() WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL", [req.workspaceId]);
       await client.query("UPDATE webhooks SET enabled = false, updated_at = now() WHERE workspace_id = $1 AND enabled", [req.workspaceId]);
       await client.query("UPDATE outbox SET status = 'failed', last_error = 'workspace_deleted', lease_expires_at = NULL, finished_at = now(), payload = CASE WHEN kind = 'email' THEN '{\"redacted\":true}'::jsonb ELSE payload END WHERE workspace_id = $1 AND status = 'pending'", [req.workspaceId]);
@@ -169,7 +176,9 @@ export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metr
       await guardLastAdministrator(client, req.workspaceId, req.params.subject);
       const result = await client.query("DELETE FROM workspace_members WHERE workspace_id = $1 AND subject = $2 RETURNING subject", [req.workspaceId, req.params.subject]);
       if (!result.rowCount) return false;
-      await apiAudit(req, client, { action: "member.removed", resourceType: "member", details: { subject: req.params.subject } });
+      await announceRevoked(client, req.workspaceId, req.params.subject); // a live stream the person has open ends now, on every instance
+      const keys = await revokeKeysCreatedBy(client, req.workspaceId, [req.params.subject]); // and the keys they made stop working
+      await apiAudit(req, client, { action: "member.removed", resourceType: "member", details: { subject: req.params.subject, ...(keys.length ? { apiKeysRevoked: keys } : {}) } });
       return true;
     });
     if (!removed) throw new HttpError(404, "not_found");
@@ -214,12 +223,12 @@ export function registerAdminRoutes(app, { db, config, auth, apiAudit, log, metr
   const needEmail = (req) => { if (!req.identity.email) throw new HttpError(403, "verified_email_required"); };
   app.get("/v1/invitations", requireHuman, h(async (req, res) => {
     needEmail(req);
-    const result = await db.query("SELECT i.id, i.email, i.role, i.expires_at, w.id AS workspace_id, w.name AS workspace_name FROM workspace_invitations i JOIN workspaces w ON w.id = i.workspace_id WHERE i.email = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() AND w.deleted_at IS NULL ORDER BY i.created_at DESC LIMIT 50", [req.identity.email]);
+    const result = await system.query("SELECT i.id, i.email, i.role, i.expires_at, w.id AS workspace_id, w.name AS workspace_name FROM workspace_invitations i JOIN workspaces w ON w.id = i.workspace_id WHERE i.email = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() AND w.deleted_at IS NULL ORDER BY i.created_at DESC LIMIT 50", [req.identity.email]);
     res.json(result.rows.map((row) => ({ id: row.id, role: row.role, expiresAt: row.expires_at, workspaceId: row.workspace_id, workspaceName: row.workspace_name })));
   }));
   app.post("/v1/invitations/:id/accept", requireHuman, h(async (req, res) => {
     needEmail(req);
-    const accepted = await db.transaction(async (client) => {
+    const accepted = await system.transaction(async (client) => {
       // Lock order is always workspace, then its children, so acceptance cannot deadlock with offboarding.
       const candidate = await client.query("SELECT workspace_id FROM workspace_invitations WHERE id = $1 AND email = $2", [req.params.id, req.identity.email]);
       if (!candidate.rowCount) throw new HttpError(404, "not_found");

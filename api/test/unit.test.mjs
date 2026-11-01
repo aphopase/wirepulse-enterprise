@@ -2,18 +2,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { ConfigError, loadConfig } from "../src/config.mjs";
-import { HttpError, decodeCursor, encodeCursor, parseLimit } from "../src/http.mjs";
+import { createDatabase } from "../src/db.mjs";
+import { HttpError, decodeCursor, encodeCursor, errorHandler, isDatabaseUnavailable, parseLimit } from "../src/http.mjs";
 import { toJunit } from "../src/junit.mjs";
 import { createLogger, maskSecrets } from "../src/log.mjs";
+import { createJobStream } from "../src/stream.mjs";
 
 const DB = "postgres://wp:secret@db.internal:5432/wirepulse";
 const dev = { DATABASE_URL: DB, DEV_BEARER_TOKEN: "dev-token-123" };
 const production = { DATABASE_URL: DB, NODE_ENV: "production", OIDC_ISSUER: "https://idp.example.com/", OIDC_AUDIENCE: "wirepulse", CORS_ORIGINS: "https://app.example.com", TRUST_PROXY: "1", DB_SSL: "verify" };
 const problemsOf = (env) => { try { loadConfig(env); } catch (error) { assert.ok(error instanceof ConfigError, `unexpected ${error}`); return error.problems.join("\n"); } assert.fail("expected the configuration to be rejected"); };
 const tempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "wp-unit-"));
+
+test("the LISTEN connection goes to LISTEN_DATABASE_URL when set, and to DATABASE_URL otherwise", async () => {
+  const listenUrl = "postgres://wp:secret@pooler-session:6432/wirepulse";
+  assert.equal(loadConfig(dev).listenDatabaseUrl, undefined);
+  assert.equal(loadConfig({ ...dev, LISTEN_DATABASE_URL: listenUrl }).listenDatabaseUrl, listenUrl);
+  assert.match(problemsOf({ ...dev, LISTEN_DATABASE_URL: "not a url" }), /LISTEN_DATABASE_URL/);
+  const hostOf = async (options) => { const db = createDatabase({ url: DB, ...options }); try { return db.newListenerClient().host; } finally { await db.close(); } };
+  assert.equal(await hostOf({}), "db.internal");
+  assert.equal(await hostOf({ listenUrl }), "pooler-session");
+});
 
 test("config: defaults are safe and the result is immutable", () => {
   const config = loadConfig(dev);
@@ -129,4 +142,39 @@ test("page size is clamped", () => {
   assert.equal(parseLimit("0"), 1); assert.equal(parseLimit("-5"), 1);
   assert.equal(parseLimit("25"), 25); assert.equal(parseLimit("100000"), 200);
   assert.equal(parseLimit("500", { max: 1000 }), 500);
+});
+
+test("a database that is down, starting, shutting down or unreachable answers 503, and an ordinary bug still answers 500", () => {
+  const down = [{ code: "57P03" }, { code: "57P01" }, { code: "25P03" }, { code: "25006" }, { code: "08006" }, { code: "ECONNREFUSED" }, { code: "ENOTFOUND" }, { code: "ECONNRESET" },
+    new Error("Connection terminated unexpectedly"), new Error("Client has encountered a connection error and is not queryable"), new Error("timeout exceeded when trying to connect")];
+  for (const error of down) assert.equal(isDatabaseUnavailable(error), true, JSON.stringify(error) + error.message);
+  for (const error of [new Error("boom"), { code: "23505" }, { code: "22P02" }, { code: "57014" }, new TypeError("x is not a function"), undefined]) assert.equal(isDatabaseUnavailable(error), false, String(error));
+  const reply = (error) => {
+    const out = {}; const res = { headersSent: false, status(code) { out.status = code; return this; }, json(body) { out.body = body; return this; } };
+    errorHandler({ log: { error() {} } })(error, { requestId: "r" }, res, () => {});
+    return out;
+  };
+  assert.deepEqual([reply({ code: "57P03" }).status, reply({ code: "57P03" }).body.error], [503, "database_unavailable"]);
+  assert.equal(reply({ code: "ECONNREFUSED" }).status, 503);
+  assert.equal(reply({ code: "57014" }).body.error, "database_timeout");
+  assert.equal(reply(new Error("boom")).status, 500);
+});
+
+test("a LISTEN connection that reports a second error after it was declared lost does not crash the process", async () => {
+  // Behind PgBouncer a killed primary produces two FATAL errors in a row; an EventEmitter throws when it emits 'error' with no listener.
+  const clients = [];
+  const newListenerClient = () => { const c = Object.assign(new EventEmitter(), { connect: async () => {}, query: async () => {}, end: async () => {} }); clients.push(c); return c; };
+  const logged = [];
+  const stream = createJobStream({
+    db: { newListenerClient, query: async () => ({ rows: [] }) }, config: { sse: { maxClients: 10, heartbeatMs: 1000, maxLifetimeMs: 1000 } },
+    log: { error: (...args) => logged.push(args), info() {} }, metrics: { listenerUp: { set() {} }, sseNotifications: { inc() {} }, sseClients: { set() {} } }
+  });
+  stream.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  const first = Object.assign(new Error("terminating connection due to unexpected postmaster exit"), { code: "57P01" });
+  const second = Object.assign(new Error("server conn crashed?"), { code: "08P01" });
+  clients[0].emit("error", first);
+  assert.doesNotThrow(() => clients[0].emit("error", second));
+  assert.equal(logged.length, 1, "only the first error is reported");
+  await stream.stop();
 });

@@ -37,6 +37,24 @@ test("persists macros, telemetry configuration, and device profiles locally", as
   await expect(page.getByRole("button", { name: "E2E ESP32", exact: true })).toBeVisible();
 });
 
+test("telemetry starts with neutral channel names and can be reset to them", async ({ page }) => {
+  await mockSerial(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Configure" }).click();
+  for (let channel = 1; channel <= 10; channel += 1) await expect(page.getByLabel(`Channel ${channel} token`)).toHaveValue(`CH${channel - 1}`);
+  await page.getByLabel("Channel 1 token").fill("VBAT");
+  await page.getByLabel("Channel 1 name").fill("Battery");
+  await page.reload();
+  await page.getByRole("button", { name: "Configure" }).click();
+  await expect(page.getByLabel("Channel 1 token")).toHaveValue("VBAT");
+  await page.getByRole("button", { name: "Reset to defaults" }).click();
+  await expect(page.getByLabel("Channel 1 token")).toHaveValue("CH0");
+  await expect(page.getByLabel("Channel 1 name")).toHaveValue("Channel 0");
+  await page.reload();
+  await page.getByRole("button", { name: "Configure" }).click();
+  await expect(page.getByLabel("Channel 1 token")).toHaveValue("CH0");
+});
+
 test("handles control-plane discovery and workspace creation with authenticated API behavior", async ({ page }) => {
   await mockSerial(page);
   let nextId = 0;

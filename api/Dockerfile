@@ -6,7 +6,10 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 FROM node:20-alpine
 # tini reaps zombies and forwards SIGTERM, so `docker stop` triggers the API's graceful shutdown.
-RUN apk add --no-cache tini
+# OpenSSL and zlib fixes reach Alpine before they reach the node image, so upgrade. The runtime only ever runs `node`: npm, npx,
+# corepack and yarn are build tools whose bundled dependencies carry their own advisories, so they are not shipped.
+RUN apk upgrade --no-cache && apk add --no-cache tini \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /opt/yarn-v* /usr/local/bin/yarn /usr/local/bin/yarnpkg
 ENV NODE_ENV=production
 WORKDIR /app
 # Root-owned and read-only to the runtime user: the process cannot modify its own code.
